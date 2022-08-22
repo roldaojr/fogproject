@@ -194,6 +194,7 @@ class BootMenu extends FOGBase
             false,
             ''
         );
+        $webserver = self::$httphost;
         $curroot = trim($curroot, '/');
         $webroot = '/fog/';
         $this->_web = sprintf('%s://%s%s', self::$httpproto, $webserver, $webroot);

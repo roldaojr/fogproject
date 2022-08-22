@@ -1930,12 +1930,12 @@ EOF
     [[ ! -e $sslpath/.srvprivate.key ]] && ln -sf $sslprivkey $sslpath/.srvprivate.key >>$error_log 2>&1
     dots "Creating SSL Certificate"
     mkdir -p $webdirdest/management/other/ssl >>$error_log 2>&1
+    extIPs=`ip -br a | grep -v lo | awk '{print$3}' | sed '/^$/d' | cut -f1 -d"/" | awk '{print ",IP:"$1""}'`
+    shortName=`echo $hostname | cut -d . -f 1`
+    subjectAltName=DNS:$hostname,DNS:$shortName`echo $extIPs`
     cat > $sslpath/ca.cnf << EOF
 [v3_ca]
-subjectAltName = @alt_names
-[alt_names]
-IP.1 = $ipaddress
-DNS.1 = $hostname
+subjectAltName = $subjectAltName
 EOF
     openssl x509 -req -in $sslpath/fog.csr -CA $sslpath/CA/.fogCA.pem -CAkey $sslpath/CA/.fogCA.key -CAcreateserial -out $webdirdest/management/other/ssl/srvpublic.crt -days 3650 -extensions v3_ca -extfile $sslpath/ca.cnf >>$error_log 2>&1
     errorStat $?
