@@ -1,0 +1,81 @@
+#!/bin/bash
+oldpwd=${pwd}
+workingdir=`dirname $0`
+cd $workingdir
+
+. /opt/fog/.fogsettings
+. ../lib/ubuntu/config.sh
+. ../lib/common/config.sh
+. ../lib/common/functions.sh
+
+systemctl=yes
+novhost=y
+
+updateDB() {
+    echo "Updating storage-node: $IF_TAG"
+    IFACE=$1
+    shift
+    IF_TAG=$1
+    IP=`ip -br addr | grep $IFACE | awk '{print$3}' | cut -f1 -d"/"`
+    mysql -u$snmysqluser -p$snmysqlpass -h$snmysqlhost $mysqldbname <<EOF
+update nfsGroupMembers set ngmHostname = '$IP', ngmInterface = '$IFACE' where ngmMemberName = 'storage-$IF_TAG';
+EOF
+}
+
+setDnsmasqBoot() {
+    cat > /etc/dnsmasq.d/boot-fog <<EOF
+log-dhcp
+pxe-service=X86PC, "Boot to FOG", ipxe.pxe
+pxe-service=X86-64_EFI, "Boot to FOG UEFI", ipxe.efi
+pxe-service=BC_EFI, "Boot to FOG UEFI PXE-BC", ipxe.efi
+EOF
+}
+
+updateDnsmasqIface() {
+    echo "Updaing DNSmasq boot: $IF_TAG"
+    IFACE=$1
+    shift
+    IF_TAG=$1
+    [ -z "$IF_TAG" ] || [ -z "$IFACE" ] || [ ! -f /etc/dnsmasq.d/boot-$IF_TAG ] && return
+    IP=`ip -br addr | grep $IFACE | awk '{print$3}' | cut -f1 -d"/"`
+    cat > /etc/dnsmasq.d/boot-$IF_TAG <<EOF
+dhcp-range=set:$IF_TAG,$IP,proxy
+dhcp-boot=tag:$IF_TAG,,,$IP
+EOF
+}
+
+updateCerts() {
+    echo "Updating SSL certs"
+    webdirdest="/var/www/fog"
+    extIPs=`ip -br a | grep -v lo | awk '{print$3}' | sed '/^$/d' | cut -f1 -d"/" | awk '{print ",IP:"$1""}'`
+    shortName=`echo $hostname | cut -d . -f 1`
+    newSSLNames=DNS:$hostname,DNS:$shortName`echo $extIPs`
+    currentSSLNames=`grep subjectAltName $sslpath/ca.cnf | cut -d '=' -f 2 | xargs -L1 echo`
+    if [[ $recreateCA == yes || $caCreated != yes || ! -e $sslpath/CA || ! -e $sslpath/CA/.fogCA.key ]]; then
+        createSSLCA
+        configureTFTPandPXE
+    else
+        if [ "$newSSLNames" = "$currentSSLNames" ]; then
+            echo "Certificate update not required"
+        else
+            echo "Recreating SSL certificate"
+            createSSLCA
+        fi
+    fi
+}
+
+basedir=/sys/class/net
+for IFACE in `ls $basedir`; do
+    IF_TAG=`cat $basedir/$IFACE/ifalias`
+    if [ -z $IF_TAG ]; then
+        continue
+    fi
+    updateDB $IFACE $IF_TAG
+    updateDnsmasqIface $IFACE $IF_TAG
+done
+setDnsmasqBoot
+updateCerts
+writeUpdateFile
+# restart services
+systemctl restart dnsmasq
+systemctl restart apache2

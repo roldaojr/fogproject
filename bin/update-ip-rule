@@ -1,0 +1,10 @@
+#!/bin/sh
+[ -z "$IF_TAG" ] || [ -z "$IFACE" ] && exit 0
+[ $IF_TAG = "server" ] && exit 0
+IP_NET=`ip -br addr | grep $IFACE | awk '{print $3}'`
+IP=`echo $IP_NET | cut -f1 -d"/"`
+NET=`ipcalc $IP_NET | grep Network | awk '{print $2}'`
+
+ip rule add iif $IFACE pref 10 lookup $IF_TAG
+ip route add $NET dev $IFACE proto kernel src $IP table $IF_TAG
+exit 0
