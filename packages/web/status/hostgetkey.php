@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Managers\HostManager;
+
 /**
  * Hostgetkey returns the host token for hostinfo getting
  *
@@ -24,21 +28,22 @@ header('Content-Type: text/plain');
 try {
     FOGCore::getHostItem(false, true);
     if (!FOGCore::$Host->isValid()) {
-        throw new Exception(_('Host Invalid'));
+        throw new \Exception(_('Host Invalid'));
     }
     #if (FOGCore::$useragent) {
     #    throw new Exception(_('Accessed inappropriately'));
     #}
     if (!FOGCore::$Host->get('task')->isValid()) {
-        throw new Exception(_('Invalid Tasking'));
+        throw new \Exception(_('Invalid Tasking'));
     }
     /**
      * Aisle 016: this endpoint is unauthenticated and MAC-resolved, and the
      * token it returns is the only gate on service/hostinfo.php's plaintext AD
-     * credentials and product key. A task merely being QUEUED is enough to reach
-     * here, so a scheduled mass deployment leaves every target harvestable for
-     * the whole scheduling window. Bind issuance to network position where the
-     * admin has been able to declare one.
+     * credentials and product key (re-enabled behind this token by aaee1b60c,
+     * after 6daab8cc4 had removed them). A task merely being QUEUED is enough to
+     * reach here, so a scheduled mass deployment leaves every target harvestable
+     * for the whole scheduling window. Bind issuance to network position where
+     * the admin has been able to declare one.
      *
      * FOG_HOSTKEY_ALLOWED_SOURCES defaults to empty, which means no restriction
      * and therefore no behaviour change on upgrade. Reuse the existing
@@ -47,32 +52,31 @@ try {
      * sees a message it already handles.
      */
     if (!FOGCore::hostKeySourceAllowed(filter_input(INPUT_SERVER, 'REMOTE_ADDR'))) {
-        throw new Exception(_('Invalid Tasking'));
+        throw new \Exception(_('Invalid Tasking'));
     }
     if (FOGCore::$Host->get('token') && FOGCore::$Host->get('tokenlock')) {
-        throw new Exception(_('Host token is currently in use'));
+        throw new \Exception(_('Host token is currently in use'));
     }
     if (!FOGCore::$Host->get('token')) {
-        $newToken = FOGCore::createSecToken();
-        FOGCore::getClass('HostManager')->update(
+        (new HostManager())->update(
             ['id' => FOGCore::$Host->get('id')],
             '',
             [
-                'token' => $newToken,
+                'token' => FOGCore::createSecToken(),
                 'tokenlock' => true
             ]
         );
-        throw new Exception($newToken);
+        throw new \Exception(FOGCore::$Host->get('token'));
     }
     if (FOGCore::$Host->isValid() && !FOGCore::$Host->get('tokenlock')) {
-        FOGCore::getClass('HostManager')->update(
+        (new HostManager())->update(
             ['id' => FOGCore::$Host->get('id')],
             '',
             ['tokenlock' => true]
         );
-        throw new Exception(FOGCore::$Host->get('token'));
+        throw new \Exception(FOGCore::$Host->get('token'));
     }
-} catch (Exception $e) {
+} catch (\Exception $e) {
     echo $e->getMessage();
     exit(1);
 }

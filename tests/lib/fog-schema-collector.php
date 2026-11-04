@@ -5,10 +5,12 @@
  * commons/schema.php is not a data file. It is a method body: it is include'd
  * from inside SchemaUpdaterPage::update() and expects that method's context --
  * $this->schema[], self::$DB, self::getClass() -- and it issues a query at file
- * scope before a single step has been collected. That is why counting its
- * elements has always looked like more trouble than it is worth: the file also
- * wants ~35 config constants and a couple of core classes, and any of those is
- * a thing an unrelated schema commit could add.
+ * scope before a single step has been collected. That is why every gate written
+ * against it before now read it as TEXT, and why tests/schema-gate.test.php
+ * counts `// N` comment labels rather than array elements: its docblock records
+ * that a real count "was tried and rejected" because the file "wants ~35 config
+ * constants and a couple of core classes, and every one of those is a thing an
+ * unrelated schema commit could add".
  *
  * That objection is answered here rather than argued with. Neither dependency is
  * listed, so neither can be outgrown:
@@ -23,15 +25,14 @@
  *     introspection schema.php performs while building its steps -- and an empty
  *     database is the state a fresh install starts from.
  *
- * The result is exact: on this branch, 286 elements at indexes 0-285,
- * contiguous, against a FOG_SCHEMA of 286. It includes the elements the
- * $keySequences foreach appends from a single line of source, which no textual
- * count can see.
+ * The result is exact: 367 elements at indexes 0-366, contiguous, against a
+ * FOG_SCHEMA of 367. It includes the 35 elements the $keySequences foreach
+ * appends from a single line of source, which no textual count can see.
  *
- * Ported from working-1.6, where tests/schema-executes.test.php uses the same
- * shim to execute the schema against a real database. Keep the two copies in
- * step: drift between two descriptions of the schema is the failure this exists
- * to catch.
+ * Extracted from tests/schema-executes.test.php, which had carried it alone.
+ * There are now two callers and there must stay ONE copy: two hand-kept shims
+ * would drift, and drift between two descriptions of the schema is the exact
+ * failure both of those tests exist to catch.
  *
  * Included, never run: run-all.sh globs tests/*.test.php at the top level only,
  * so a helper in tests/lib/ is invisible to it.
@@ -242,15 +243,31 @@ class SchemaCollector extends SchemaStub
 
 spl_autoload_register(
     function ($class) {
-        // schema.php is global-namespaced, so anything carrying a separator is
-        // not a name it could have written and not ours to invent.
-        if (strpos($class, '\\') !== false) {
+        // Namespaced names are stubbed too, in their own namespace.
+        //
+        // schema.php used to be able to name only global classes, because
+        // core re-exported every one of them there. It now carries `use
+        // FOG\Items\Schema;` and friends (ADR 0013 §2), so `Schema::` in
+        // that file means FOG\Items\Schema and a global stub answers
+        // nothing -- the collector died on the file's second line.
+        //
+        // The stub is declared where the name says it lives, and still
+        // extends the one global SchemaStub, so every shimmed method stays in
+        // one place regardless of which namespace asked for it.
+        if (!preg_match(
+            '/^[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)*$/',
+            $class
+        )) {
             return;
         }
-        if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $class)) {
+        $pos = strrpos($class, '\\');
+        if (false === $pos) {
+            eval("class {$class} extends SchemaStub {}");
             return;
         }
-        eval("class {$class} extends SchemaStub {}");
+        $ns = substr($class, 0, $pos);
+        $short = substr($class, $pos + 1);
+        eval("namespace {$ns}; class {$short} extends \\SchemaStub {}");
     }
 );
 

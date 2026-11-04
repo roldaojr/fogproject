@@ -48,8 +48,9 @@
 cd "$(dirname "$0")/.." || exit 1
 FUNCS="lib/common/functions.sh"
 CONF="lib/common/config.sh"
+PLUG="bin/fetch-plugins.sh"
 
-for f in "$FUNCS" "$CONF"; do
+for f in "$FUNCS" "$CONF" "$PLUG"; do
     [[ -r $f ]] || { echo "cannot read $f -- run this from the repository"; exit 1; }
 done
 
@@ -86,7 +87,7 @@ fi
 echo
 echo "2. every remote fetch is bounded"
 
-# Remote curls only. The maintenance/* calls to $ipaddress are this same host
+# Remote curls only. The maintenance/* calls to ${NET_fog_server_ip} are this same host
 # over loopback or the LAN, which cannot exhibit the 300s stall being guarded.
 # joined <file> -- the file with backslash continuations folded onto one line
 # and comment lines dropped. Both matter: every bounded call here is written
@@ -102,8 +103,14 @@ joined() {
 # here unnoticed. The three exclusions are named individually so a NEW remote
 # call cannot accidentally inherit one:
 #
-#   ipaddress     the maintenance/* posts -- this same host over loopback
-#   dbhttpcode=   backupDB's fetch of backup_db.php, likewise $ipaddress
+#   NET_fog_server_ip
+#                 the maintenance/* posts -- this same host over loopback
+#   selfName      the schema post and the liveness probe. Same host, same
+#                 loopback: these address it by the name its own certificate
+#                 carries instead of by ${NET_fog_server_ip}, because no public CA will
+#                 issue for an address and the old form could not verify on an
+#                 ACME install. A rename, not a new remote fetch.
+#   dbhttpcode=   backupDB's fetch of backup_db.php, likewise this same host
 #   nodecert.php  a storage node asking its master for a certificate: LAN, not
 #                 the internet. Still unbounded, and still able to stall a node
 #                 install if the master is down -- out of scope here, but a
@@ -115,7 +122,8 @@ remotecurls() {
     joined "$1" \
         | grep -E '(^|[^-[:alnum:]_])curl[[:space:]]+-' \
         | grep -vE '^[[:space:]]*echo ' \
-        | grep -v 'ipaddress' \
+        | grep -v 'NET_fog_server_ip' \
+        | grep -v 'selfName' \
         | grep -v 'dbhttpcode=' \
         | grep -v 'nodecert.php'
 }
@@ -146,7 +154,7 @@ while IFS= read -r line; do
         nostall=$((nostall + 1))
         printf '        no stall guard:   %s\n' "$short"
     fi
-done < <(remotecurls "$FUNCS")
+done < <(remotecurls "$FUNCS"; remotecurls "$PLUG")
 
 if [[ $unbounded -eq 0 ]]; then
     ok "every remote curl bounds its connect"
@@ -159,6 +167,24 @@ else
     bad "$nostall remote curl call(s) have neither a total cap nor --speed-time"
 fi
 
+# A remote curl that saves to a file with -O must carry -f. Without it an HTTP
+# error page is written in place of the asset. The kernel loop did this: a
+# GitHub error page landed as bzImage32 AND bzImage32.sha256, and the only
+# trace was "no properly formatted checksum lines found" ten times over.
+# Bundled short flags only (-sSfOL): that is how every -O call here is spelled.
+nofail=0
+while IFS= read -r line; do
+    printf '%s\n' "$line" | grep -qE -- ' -[[:alpha:]]*O' || continue
+    printf '%s\n' "$line" | grep -qE -- ' (-[[:alpha:]]*f|--fail)' && continue
+    nofail=$((nofail + 1))
+    printf '        no --fail:        %s\n' "$(printf '%s' "$line" | sed 's/^ *//;s/  */ /g' | cut -c1-96)"
+done < <(remotecurls "$FUNCS"; remotecurls "$PLUG")
+if [[ $nofail -eq 0 ]]; then
+    ok "every remote curl that saves with -O fails on an HTTP error"
+else
+    bad "$nofail remote curl call(s) save with -O but lack -f -- an error page becomes the file"
+fi
+
 # The asset downloads must NOT carry --max-time: these are multi-megabyte
 # tarballs and a slow but working link has to be allowed to finish. The stall
 # they need protecting from is a transfer that opens and then stops, which is
@@ -168,7 +194,11 @@ fi
 # artifact fetch and may legitimately take a while", and --max-time on top of
 # that reintroduces the failure on slow links that the stall guard exists to
 # avoid.
-both=$(remotecurls "$FUNCS" | grep -- '--speed-time' | grep -c -- '--max-time')
+both=0
+for f in "$FUNCS" "$PLUG"; do
+    n=$(remotecurls "$f" | grep -- '--speed-time' | grep -c -- '--max-time')
+    both=$((both + n))
+done
 if [[ $both -eq 0 ]]; then
     ok "no artifact download carries both --speed-time and --max-time"
 else
@@ -177,27 +207,13 @@ fi
 
 # wget's defaults are worse than curl's: no connect timeout at all, and
 # --tries=20, so an unreachable host costs twenty full SYN retry cycles.
-#
-# Same discipline as remotecurls: a flag after the command is an invocation,
-# prose is not. On this branch most wgets go to $ipaddress (this host over
-# loopback, including $probeUrl, which is built from it), so only the udpcast
-# config.guess/config.sub pair is genuinely remote.
-remotewgets() {
-    joined "$1" \
-        | grep -E '(^|[^-[:alnum:]_])wget[[:space:]]+-' \
-        | grep -vE '^[[:space:]]*(echo|dots) ' \
-        | grep -v 'ipaddress' \
-        | grep -v 'probeUrl' \
-        | grep -v 'packages='
-}
-
 unboundedwget=0
 while IFS= read -r line; do
     [[ -n $line ]] || continue
     printf '%s\n' "$line" | grep -q -- '--connect-timeout' && continue
     unboundedwget=$((unboundedwget + 1))
     printf '        unbounded: %s\n' "$(printf '%s' "$line" | sed 's/^ *//;s/  */ /g' | cut -c1-100)"
-done < <(remotewgets "$FUNCS")
+done < <(joined "$FUNCS" | grep 'wget ')
 
 if [[ $unboundedwget -eq 0 ]]; then
     ok "no wget in $FUNCS lacks --connect-timeout"
@@ -243,7 +259,7 @@ echo
 echo "5. the check probes the hosts FOG actually downloads from"
 
 probed=$(body checkInternetConnection "$FUNCS")
-for v in ipxegit ipxeurl; do
+for v in ipxegit ipxeurl pluginsgit pluginsurl; do
     if printf '%s' "$probed" | grep -q "\$$v"; then
         ok "probes \$$v"
     else
@@ -259,7 +275,7 @@ for h in httpbin.org neverssl.com fogproject.org; do
 done
 
 echo
-echo "6. an unroutable host fails fast (behavioural)"
+echo "6. an unroutable host fails fast (behavioral)"
 
 error_log=$(mktemp)
 trap 'rm -f "$error_log"' EXIT

@@ -1,0 +1,571 @@
+<?php
+/**
+ * The image object
+ *
+ * PHP version 7.4+
+ *
+ * @category Image
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+
+namespace FOG\Items;
+
+use FOG\Base\FOGController;
+use FOG\Managers\HostManager;
+use FOG\Router\Route;
+
+/**
+ * The image object
+ *
+ * @category Image
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+class Image extends FOGController
+{
+    /**
+     * The image table
+     *
+     * @var string
+     */
+    protected $databaseTable = 'images';
+    /**
+     * The Image table fields and common names
+     *
+     * @var array
+     */
+    protected $databaseFields = [
+        'id' => 'imageID',
+        'name' => 'imageName',
+        'description' => 'imageDesc',
+        'path' => 'imagePath',
+        'createdTime' => 'imageDateTime',
+        'createdBy' => 'imageCreateBy',
+        'building' => 'imageBuilding',
+        'size' => 'imageSize',
+        'imageTypeID' => 'imageTypeID',
+        'imagePartitionTypeID' => 'imagePartitionTypeID',
+        'osID' => 'imageOSID',
+        'deployed' => 'imageLastDeploy',
+        'format' => 'imageFormat',
+        'magnet' => 'imageMagnetUri',
+        'protected' => 'imageProtect',
+        'compress' => 'imageCompress',
+        'isEnabled' => 'imageEnabled',
+        'toReplicate' => 'imageReplicate',
+        'srvsize' => 'imageServerSize',
+        // The architecture of the machine this image was captured from, as a
+        // row in `architectures` (schema step 372; it was a free-text column
+        // in 370). Stamped by TaskQueue::_moveUpload() when the captured
+        // bytes land, and settable by hand on the edit form for images
+        // captured before any of this existed. NULL means not recorded, which
+        // is why Architecture::canRun() treats unknown as allowed.
+        'archID' => 'imageArchID',
+        // The LOGICAL sector size, in bytes, of the disk this image was
+        // captured from -- 512 or 4096, NULL when unknown. Read out of the
+        // image's own sfdisk dump; see parseSectorSize(). Schema step 371.
+        'sectorsize' => 'imageSectorSize'
+    ];
+    /**
+     * The required fields
+     *
+     * @var array
+     */
+    protected $databaseFieldsRequired = [
+        'name',
+        'path',
+        'imageTypeID',
+        'osID'
+    ];
+    /**
+     * Additional fields
+     *
+     * @var array
+     */
+    protected $additionalFields = [
+        'hosts',
+        'storagegroups',
+        'os',
+        'imagepartitiontype',
+        'imagetype',
+        'arch'
+    ];
+    /**
+     * Database -> Class field relationships
+     *
+     * @var array
+     */
+    protected $databaseFieldClassRelationships = [
+        'OS' => [
+            'id',
+            'osID',
+            'os'
+        ],
+        'ImagePartitionType' => [
+            'id',
+            'imagePartitionTypeID',
+            'imagepartitiontype'
+        ],
+        'ImageType' => [
+            'id',
+            'imageTypeID',
+            'imagetype'
+        ],
+        'Architecture' => [
+            'id',
+            'archID',
+            'arch'
+        ]
+    ];
+    /**
+     * The logical sector size recorded in an sfdisk dump.
+     *
+     * FOS writes the source disk's geometry into the dump at capture, and
+     * util-linux 2.35+ puts the logical sector size on its own line:
+     *
+     *     label: gpt
+     *     device: /dev/sda
+     *     unit: sectors
+     *     sector-size: 4096
+     *
+     * This is the same line, read the same way, that
+     * validateImageSectorSize() in FOS's funcs.sh keys its refusal off. Two
+     * readers of one fact is one too many, but the alternative is asking FOS
+     * to report something it has been writing to disk for years -- which
+     * would need an init release to reach anybody.
+     *
+     * Returns 0 when the dump has no such line. That is not a failure: dumps
+     * written before util-linux 2.35 do not carry it, and FOS treats the same
+     * absence as "allow the deploy rather than guess". Nothing here may be
+     * stricter than the code doing the actual refusing.
+     *
+     * @param string $dump the contents of a d<N>.*partitions file
+     *
+     * @return int bytes, or 0 when the dump does not say
+     */
+    public static function parseSectorSize($dump)
+    {
+        if (!preg_match('/^sector-size:\\s*(\\d+)\\s*$/mi', (string)$dump, $m)) {
+            return 0;
+        }
+
+        return (int)$m[1];
+    }
+    /**
+     * How a sector size should be described to a person.
+     *
+     * 4096 is 4Kn. 512 is deliberately NOT called "512n" or "512e": those
+     * differ only in PHYSICAL block size, which no capture records, and they
+     * are interchangeable as deploy targets anyway because only the logical
+     * size governs whether an image's geometry fits. Claiming one or the
+     * other would be inventing a fact.
+     *
+     * @param int $bytes the logical sector size
+     *
+     * @return string '' when unknown
+     */
+    public static function sectorSizeLabel($bytes)
+    {
+        $bytes = (int)$bytes;
+        if ($bytes < 1) {
+            return '';
+        }
+        if (4096 === $bytes) {
+            return '4Kn (4096-byte logical sectors)';
+        }
+        if (512 === $bytes) {
+            return '512n/512e (512-byte logical sectors)';
+        }
+
+        return sprintf('%d-byte logical sectors', $bytes);
+    }
+    /**
+     * Removes the item from the database
+     *
+     * @param string $key the key to remove
+     *
+     * @throws Exception
+     * @return object
+     */
+    public function destroy($key = 'id')
+    {
+        // DESTROY_IMAGE is fired by Route::deletemass(), not here, for the same
+        // reason DESTROY_HOST moved: the REST delete path never builds an
+        // Image, so this override -- and the event with it -- never ran there.
+        //
+        // Funnel cleanup through the single cascade authority: the image case in
+        // Route::deletemass already resets HostManager imageID=0 and removes
+        // imageassociation rows, and fires DELETEMASS_API for plugins. deletemass
+        // also deletes the image row; the trailing parent::destroy() is a
+        // harmless no-op that preserves the audit-log/history entry.
+        Route::deletemass('image', ['id' => $this->get('id')]);
+        return parent::destroy($key);
+    }
+    /**
+     * Stores data into the database
+     *
+     * @return bool|object
+     */
+    public function save()
+    {
+        // Propagate a failed write rather than reporting success; the
+        // association work below has no row to attach to either. See
+        // tests/save-propagates-failure.test.php.
+        if (!parent::save()) {
+            return false;
+        }
+        // isDirty(), not isPopulated(): isPopulated() is also true when
+        // 'hosts' was merely lazy-loaded for reading, which would make an
+        // unrelated image save (e.g. renaming it) re-run this whole
+        // reassignment block for a no-op result. isDirty() only reports
+        // true when the caller actually set the host list.
+        if ($this->isDirty('hosts')) {
+            $ids = Route::getIds(
+                'host',
+                ['imageID' => $this->get('id')]
+            );
+            if (count($this->get('hosts')) > 0) {
+                $DBIDs = $ids;
+            } else {
+                $RemIDs = $ids;
+            }
+            if (!isset($RemIDs)) {
+                $DBCount = count($DBIDs);
+                $tokeep = count($this->get('hosts'));
+                if ($DBCount > 0
+                    && $DBCount != $tokeep
+                ) {
+                    $RemIDs = array_diff(
+                        (array)$DBIDs,
+                        (array)$this->get('hosts')
+                    );
+                }
+            }
+            $RemIDs = array_filter($RemIDs ?? []);
+            if (count($RemIDs) > 0) {
+                (new HostManager())->update(
+                    [
+                        'imageID' => $this->get('id'),
+                        'id' => $RemIDs
+                    ],
+                    '',
+                    // NULL, not 0 -- see schema step 386. A host with no
+                    // image is a host whose hostImage is NULL.
+                    ['imageID' => null]
+                );
+                unset($RemIDs);
+            }
+            if (count($this->get('hosts')) < 1) {
+                return $this;
+            }
+            (new HostManager())
+                ->update(
+                    ['id' => $this->get('hosts')],
+                    '',
+                    ['imageID' => $this->get('id')]
+                );
+        }
+        $find = [
+            'imageID' => $this->get('id'),
+            'primary' => 1
+        ];
+        $primary = Route::getIds(
+            'imageassociation',
+            $find,
+            'storagegroupID'
+        );
+        $this->assocSetter('Image', 'storagegroup');
+        if (count($primary) > 0) {
+            $primary = array_shift($primary);
+            self::setPrimaryGroup($primary, $this->get('id'));
+        }
+        return $this->load();
+    }
+    /**
+     * Deletes the image file
+     *
+     * @return bool
+     */
+    public function deleteFile()
+    {
+        if ($this->get('protected')) {
+            throw new \Exception(self::$foglang['ProtectedImage']);
+        }
+        foreach ($this->get('storagegroups') as $storagegroupID) {
+            (new FileDeleteQueue())
+                ->set('path', $this->get('path'))
+                ->set('pathtype', 'Image')
+                ->set('createdTime', self::storageNow())
+                ->set('stateID', self::getQueuedState())
+                ->set('createdBy', self::$FOGUser->get('name'))
+                ->set('storagegroupID', $storagegroupID)
+                ->save();
+        }
+        return true;
+    }
+    /**
+     * Loads hosts
+     *
+     * @return void
+     */
+    protected function loadHosts()
+    {
+        $this->_loadHostIds('host', ['imageID' => $this->get('id')]);
+    }
+    /**
+     * Add hosts to image object
+     *
+     * @param array $addArray the items to add
+     *
+     * @return object
+     */
+    public function addHost($addArray)
+    {
+        return $this->addRemItem(
+            'hosts',
+            (array)$addArray,
+            'merge'
+        );
+    }
+    /**
+     * Remove hosts from image object
+     *
+     * @param array $removeArray the items to remove
+     *
+     * @return object
+     */
+    public function removeHost($removeArray)
+    {
+        return $this->addRemItem(
+            'hosts',
+            (array)$removeArray,
+            'diff'
+        );
+    }
+    /**
+     * Loads storage groups with this object
+     *
+     * @return void
+     */
+    protected function loadStoragegroups()
+    {
+        $find = ['imageID' => $this->get('id')];
+        $groups = Route::getIds(
+            'imageassociation',
+            $find,
+            'storagegroupID'
+        );
+        if (count($groups) < 1) {
+            $groups = Route::getIds('storagegroup', false);
+            $groups = [self::minId($groups)];
+        }
+        $this->set('storagegroups', $groups);
+    }
+    /**
+     * Adds groups to this object
+     *
+     * @param array $addArray the items to add
+     *
+     * @return object
+     */
+    public function addGroup($addArray)
+    {
+        return $this->addRemItem(
+            'storagegroups',
+            (array)$addArray,
+            'merge'
+        );
+    }
+    /**
+     * Removes groups from this object
+     *
+     * @param array $removeArray the items to remove
+     *
+     * @return object
+     */
+    public function removeGroup($removeArray)
+    {
+        return $this->addRemItem(
+            'storagegroups',
+            (array)$removeArray,
+            'diff'
+        );
+    }
+    /**
+     * Gets the storage group
+     *
+     * @throws Exception
+     * @return object
+     */
+    public function getStorageGroup()
+    {
+        $groupids = $this->get('storagegroups');
+        $count = count($groupids);
+        if ($count < 1) {
+            $groupids = Route::getIds('storagegroup', false);
+            $groupids = [self::minId($groupids)];
+            if (count($groupids) < 1) {
+                throw new \Exception(_('No viable storage groups found'));
+            }
+        }
+        $primaryGroup = [];
+        foreach ($groupids as &$groupid) {
+            if (!self::getPrimaryGroup($groupid, $this->get('id'))) {
+                continue;
+            }
+            $primaryGroup[] = $groupid;
+            unset($groupid);
+        }
+        if (count($primaryGroup) < 1) {
+            $primaryGroup = self::minId($groupids);
+        } else {
+            $primaryGroup = array_shift($primaryGroup);
+        }
+
+        return new StorageGroup($primaryGroup);
+    }
+    /**
+     * Returns the OS object
+     *
+     * @return object
+     */
+    public function getOS()
+    {
+        return $this->get('os');
+    }
+    /**
+     * Returns the ImageType object
+     *
+     * @return object
+     */
+    public function getImageType()
+    {
+        return $this->get('imagetype');
+    }
+    /**
+     * Returns the ImagePartitionType object
+     *
+     * @return object
+     */
+    public function getImagePartitionType()
+    {
+        return $this->get('imagepartitiontype');
+    }
+    /**
+     * Returns the Architecture object
+     *
+     * @return Architecture
+     */
+    public function getArch()
+    {
+        return $this->get('arch');
+    }
+    /**
+     * Returns the partition type
+     *
+     * @return string
+     */
+    public function getPartitionType()
+    {
+        return $this->getImagePartitionType()->get('type');
+    }
+    /**
+     * Gets the image's primary group
+     *
+     * @param int $groupID the group id to check
+     * @param int $imageID the image id to check
+     *
+     * @return bool
+     */
+    public static function getPrimaryGroup($groupID, $imageID)
+    {
+        if (!$imageID) {
+            return true;
+        }
+        $primaryCount = Route::getCount(
+            'imageassociation',
+            [
+                'imageID' => $imageID,
+                'primary' => 1
+            ]
+        );
+        if ($primaryCount < 1) {
+            // The image has no primary group. Promote the lowest group that is
+            // already associated to primary; if none are associated at all,
+            // fall back to the lowest storage group. Mirrors
+            // Snapin::getPrimaryGroup(). The previous Route::indiv('image', ...)
+            // re-serialized this same image, which re-entered
+            // getStorageGroup()/getPrimaryGroup() and recursed until memory was
+            // exhausted for any image lacking a primary association.
+            $groupids = Route::getIds(
+                'imageassociation',
+                ['imageID' => $imageID],
+                'storagegroupID'
+            );
+            if (count($groupids) < 1) {
+                $groupids = Route::getIds('storagegroup', false);
+            }
+            $groupid = self::minId($groupids);
+            if ($groupid > 0) {
+                self::setPrimaryGroup($groupid, $imageID);
+            }
+        }
+        $find = [
+            'storagegroupID' => $groupID,
+            'imageID' => $imageID
+        ];
+        $assocID = Route::getIds(
+            'imageassociation',
+            $find
+        );
+        $assocID = self::minId($assocID);
+
+        return (new ImageAssociation($assocID))->isPrimary();
+    }
+    /**
+     * Gets the primary storage group.
+     *
+     * @return object
+     */
+    public function getPrimaryStorageGroup()
+    {
+        $groupids = Route::getIds(
+            'imageassociation',
+            [
+                'imageID' => $this->get('id'),
+                'storagegroupID' => $this->get('storagegroups'),
+                'primary' => [1],
+            ],
+            'storagegroupID'
+        );
+        if (count($groupids ?: []) < 1) {
+            $groupid = self::minId($this->get('storagegroups'));
+        } else {
+            $groupid = self::minId($groupids);
+        }
+        return new StorageGroup($groupid);
+    }
+    /**
+     * Sets the primary group for the image
+     *
+     * @param int $groupID the id to set as primary
+     * @param int $imageID the id to use with primary group
+     *
+     * @return array
+     */
+    public static function setPrimaryGroup($groupID, $imageID)
+    {
+        self::_setPrimaryGroup(
+            $groupID,
+            $imageID,
+            'imageID',
+            'imageassociation',
+            'ImageAssociation'
+        );
+    }
+}

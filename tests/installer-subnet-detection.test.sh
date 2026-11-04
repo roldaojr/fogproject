@@ -13,14 +13,15 @@
 #                        so the primary could be one no client can reach.
 #   getCidr()            the SECOND global address's prefix (head -n2 | tail
 #                        -n1), through an unanchored grep, so eth1 matched eth10.
-#   configureDHCP        every global address, passed unquoted to mask2network,
-#                        so a second address became the MASK.
+#   configureDHCP        the first global address, which is not always
+#                        ${NET_fog_server_ip}; writeKeaSample took every one,
+#                        unquoted, so a second address became the MASK.
 #   interface2broadcast  the first brd on the interface, whichever address.
 #
-# Also: cidr2mask "" printed "arithmetic syntax error ... /8", and mask2cidr
-# printed its error on stdout, where the caller took it as the prefix.
+# Also: cidr2mask "" printed "arithmetic syntax error ... /8".
 #
-# Everything now derives from ONE address, $ipaddress, the one FOG advertises.
+# Everything now derives from ONE address, ${NET_fog_server_ip}, the one FOG
+# advertises.
 #
 # A fake `ip` replays each address layout. Its rows are the one-line form
 # iproute2 prints for `ip -o`, copied from a real host. It builds the multi-line
@@ -89,14 +90,15 @@ table() { local name=$1; shift; printf '%s\n' "$@" > "$WORK/$name"; }
 lo=$(row 1 lo 127.0.0.1/8 "" host)
 nat=$(row 3 ens37 192.168.137.130/24 192.168.137.255 "global dynamic noprefixroute")
 primary=$(row 2 ens33 10.0.45.2/24 10.0.45.255 "global noprefixroute")
-# A second address in the same /24. With the old code this reproduces the
-# report exactly: subnet "10.0.45.2/24", pool "10.0.45.12 - 10.0.45.254".
+# A second address in the same /24.
 table second "$lo" "$primary" "$(row 2 ens33 10.0.45.14/24 10.0.45.255 'global secondary dynamic noprefixroute')" "$nat"
 # The report's "stray 169.254.x.x/16 line", added as a global address.
 # With the old code this is the saved 255.255.0.0.
 table llglobal "$lo" "$primary" "$(row 2 ens33 169.254.33.7/16 169.254.255.255 'global noprefixroute')" "$nat"
 # Link-local listed first, as a link-scope address.
 table llfirst "$lo" "$(row 2 ens33 169.254.33.7/16 169.254.255.255 link)" "$primary" "$nat"
+# The same, as a global address: the old configureDHCP took it as the server.
+table llglobalfirst "$lo" "$(row 2 ens33 169.254.33.7/16 169.254.255.255 'global noprefixroute')" "$primary" "$nat"
 # DHCP never answered on the deployment NIC: link-local only. With the old
 # code this is the reported "arithmetic syntax error ... /8".
 table llonly "$lo" "$(row 2 ens33 169.254.33.7/16 169.254.255.255 link)" "$nat"
@@ -123,27 +125,27 @@ eval "$(declare -f configureKeaDHCP | sed '1s/^configureKeaDHCP/_realConfigureKe
 configureKeaDHCP() { _realConfigureKeaDHCP >/dev/null 2>&1; return 1; }
 
 # The two input.sh lines under test, run as written rather than retyped here.
-ipline=$(grep -m1 -E '^[[:space:]]*ipaddress=\$\(ip -4 addr show' "$INPUT")
-maskline=$(grep -m1 -E '^[[:space:]]*submask=\$\(cidr2mask' "$INPUT")
-[[ -n $ipline ]] && ok "input.sh ipaddress assignment found" || bad "input.sh ipaddress assignment found"
-[[ -n $maskline ]] && ok "input.sh submask assignment found" || bad "input.sh submask assignment found"
+ipline=$(grep -m1 -E '^[[:space:]]*NET_fog_server_ip=\$\(ip -4 addr show' "$INPUT")
+maskline=$(grep -m1 -E '^[[:space:]]*NET_subnet_mask=\$\(cidr2mask' "$INPUT")
+[[ -n $ipline ]] && ok "input.sh address assignment found" || bad "input.sh address assignment found"
+[[ -n $maskline ]] && ok "input.sh mask assignment found" || bad "input.sh mask assignment found"
 
 jsonval() { sed -n "s/.*\"$1\": \"\\([^\"]*\\)\".*/\\1/p" "$2" | head -n1; }
 
 # Replays input.sh's detection, then configureDHCP and writeKeaSample.
 detect() {
     FAKE_IP_TABLE="$WORK/$1"
-    interface=$2
-    unset ipaddress ipaddresses submask network startrange endrange
+    NET_interface=$2
+    unset NET_fog_server_ip PKI_san_ip_addresses NET_subnet_mask network DHCP_range_start DHCP_range_end
     eval "$ipline"
-    ipaddresses="$ipaddress"
+    PKI_san_ip_addresses="${NET_fog_server_ip}"
     eval "$maskline" 2>"$WORK/mask.err"
-    [[ -n $ipaddress ]] && normalizeIpAddress
+    [[ -n ${NET_fog_server_ip} ]] && normalizeIpAddress
 }
 build() {
     rm -f "$WORK/kea.conf" "$WORK/web/kea-dhcp4.conf.fog-sample"
-    unset network startrange endrange
-    bldhcp=1 dhcpengine=kea dhcpconfig="$WORK/kea.conf" exitFail=1 webdirdest="$WORK/web"
+    unset network DHCP_range_start DHCP_range_end
+    DHCP_enabled=yes DHCP_engine=kea dhcpconfig="$WORK/kea.conf" exitFail=1 webdirdest="$WORK/web"
     configureDHCP >/dev/null 2>&1
     writeKeaSample >/dev/null 2>&1
 }
@@ -154,25 +156,26 @@ expect_config() {
     is "$(jsonval pool "$WORK/web/kea-dhcp4.conf.fog-sample")" "10.0.45.10 - 10.0.45.254" "$1: sample pool"
 }
 
-for layout in second llglobal llfirst; do
+for layout in second llglobal llfirst llglobalfirst; do
     echo "$layout:"
     detect "$layout" ens33
-    is "$ipaddress" 10.0.45.2 "$layout: primary address"
-    is "$submask" 255.255.255.0 "$layout: saved mask"
+    # A global link-local listed first is still skipped by input.sh.
+    is "${NET_fog_server_ip}" 10.0.45.2 "$layout: primary address"
+    is "${NET_subnet_mask}" 255.255.255.0 "$layout: saved mask"
     build
     expect_config "$layout"
     # A re-run starts from the saved mask, and the sample writer derives its own.
-    saved=$submask
-    unset submask
+    saved=${NET_subnet_mask}
+    unset NET_subnet_mask
     build
-    is "$submask" 255.255.255.0 "$layout: mask derived by configureDHCP"
-    submask=$saved
+    is "${NET_subnet_mask}" 255.255.255.0 "$layout: mask derived by configureDHCP"
+    NET_subnet_mask=$saved
     expect_config "$layout (derived mask)"
 done
 
 echo "llonly:"
 detect llonly ens33
-is "$ipaddress" "" "llonly: a link-local address is not a server address"
+is "${NET_fog_server_ip}" "" "llonly: a link-local address is not a server address"
 grep -q 'arithmetic' "$WORK/mask.err" && bad "llonly: no arithmetic error while reading the mask" || ok "llonly: no arithmetic error while reading the mask"
 
 echo "anchor:"

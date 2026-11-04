@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Db\Mysqldump;
+
 /**
  * Backs up the db for us
  *
@@ -21,13 +25,8 @@
  */
 require '../commons/base.inc.php';
 
-// Restrict to same-machine requests only. This dumps the entire database with
-// no authentication of any kind, and the installer is its only caller -- it
-// posts here from the server's own IP, so loopback and SERVER_ADDR both pass
-// while anything off-box does not. installfog.sh removes this whole directory
-// when it finishes, so the exposure is bounded by an install's duration, but
-// an unauthenticated full dump is not something to leave reachable for even
-// that long.
+// Restrict to same-machine requests only. The installer calls this via the
+// server's own IP, so loopback and SERVER_ADDR are both permitted.
 $_remoteIp = $_SERVER['REMOTE_ADDR'] ?? '';
 $_serverIp = $_SERVER['SERVER_ADDR'] ?? '';
 if ($_remoteIp !== '127.0.0.1'
@@ -39,4 +38,34 @@ if ($_remoteIp !== '127.0.0.1'
 }
 unset($_remoteIp, $_serverIp);
 
-FOGCore::getClass('ReportMaker')->outputReport(3, true);
+$backup_name = 'fog_backup_'
+    . FOGCore::formatTime('now', 'Ymd_His');
+// Not a fixed name under the system temp dir: this dumps every credential
+// in the deployment, and a guessable path is world-readable under the
+// default umask, collides with a concurrent run, and is a symlink target
+// -- fopen() follows one. Same fix as Schema::exportdb() (GH-1410).
+$tmpfile = tempnam(sys_get_temp_dir(), 'fog_backup_');
+if (false === $tmpfile) {
+    throw new \Exception(_('Could not create tmp file.'));
+}
+chmod($tmpfile, 0600);
+$data = '';
+(new Mysqldump())->start($tmpfile);
+if (!file_exists($tmpfile) || !is_readable($tmpfile)) {
+    throw new \Exception(_('Could not read file from tmp folder.'));
+}
+$fh = fopen($tmpfile, 'rb');
+while (!feof($fh)) {
+    $data .= fread($fh, 4096);
+}
+fclose($fh);
+unlink($tmpfile);
+echo json_encode(
+    [
+        'title' => _('Export Success'),
+        'msg' => _('Export Complete'),
+        '_filename' => $backup_name,
+        '_content' => $data
+    ]
+);
+unset($data);

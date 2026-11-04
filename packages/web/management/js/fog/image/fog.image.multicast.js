@@ -1,0 +1,179 @@
+(function($) {
+
+    var sessionCreateBtn = $('#session-create'),
+        sessionCreateForm = $('#session-create-form'),
+        sessionCreateModal = $('#createModal'),
+        sessionCreateModalConfirmBtn = $('#createConfirmModalBtn'),
+        sessionCreateModalCancelBtn = $('#createCancelModalBtn'),
+        // Cancel elements
+        sessionCancelBtn = $('#session-cancel'),
+        sessionModal = $('#cancelModal'),
+        sessionModalConfirmBtn = $('#confirmModalBtn'),
+        sessionModalCancelBtn = $('#cancelModalBtn'),
+        // Main Table
+        sessionTable = $('#multicast-sessions-table'),
+        reloadinterval,
+        sessionReloadToggle = $('#session-reload-toggle');
+
+    function reload(callback, userpaging) {
+        if (reloadinterval) {
+            clearTimeout(reloadinterval);
+        }
+        // Stop the auto-refresh once this page has been swapped out by an AJAX
+        // nav. setTimeout isn't tracked by clearAllIntervals(), and because the
+        // table is serverSide the draw() re-POSTs, so an unguarded re-arm would
+        // keep hitting getSessionsList forever after you leave.
+        if (!document.body.contains(sessionTable[0])) {
+            return;
+        }
+        sessionsTable.draw(false);
+        reloadinterval = setTimeout(reload, 5000);
+    }
+
+    function sessionTableButtons(disable) {
+        sessionCancelBtn.prop('disabled', disable);
+    }
+
+    sessionCreateForm.on('submit', function(e) {
+        e.preventDefault();
+    });
+
+    sessionCreateModalConfirmBtn.on('click', function(e) {
+        e.preventDefault();
+        sessionCreateForm.processForm(function(err) {
+            if (err) {
+                return;
+            }
+            $('#sessionname, #sessioncount, #sessiontimeout, #image').val('');
+            // dropdownParent, or this re-init undoes the one
+            // fog.common.js gave #image at page load. The select carries
+            // fog-select2, so the shared loop already anchored its dropdown
+            // to this modal; re-initializing without the option re-parents
+            // it to <body> at z-index 1051, under the modal's 1055. Measured:
+            // before the re-init the topmost element over the open dropdown
+            // is select2's own search field, after it the modal's help
+            // paragraph. So the FIRST session creates fine and every one
+            // after it in the same modal has an invisible image list.
+            $('#image').select2({
+                width: '100%',
+                dropdownParent: sessionCreateModal
+            });
+            sessionsTable.draw(false);
+            sessionsTable.rows({selected: true}).deselect();
+            sessionCreateModal.modal('hide');
+        });
+    });
+
+    sessionCreateBtn.on('click', function(e) {
+        e.preventDefault();
+        sessionTableButtons(true)
+        sessionCreateModal.modal('show');
+    });
+
+    function onSessionSelect(selected) {
+        var disabled = selected.count() == 0;
+        sessionTableButtons(disabled);
+    }
+
+    var sessionsTable = sessionTable.registerTable(onSessionSelect, {
+        order: [
+            [0, 'asc']
+        ],
+        columns: [
+            {data: 'name'},
+            {data: 'image'},
+            {data: 'clients'},
+            {data: 'percent'}
+        ],
+        rowId: 'id',
+        columnDefs: [
+            {
+                responsivePriority: -1,
+                render: function(data, type, row) {
+                    return '<a href="../management/index.php?node='
+                        + Common.node
+                        + '&sub=edit&id='
+                        + row.imageid
+                        + '">'
+                        + row.imagename
+                        + '</a>';
+                },
+                targets: 1
+            },
+            {
+                render: function(data, type, row) {
+                    if (type !== 'display') {
+                        return data;
+                    }
+                    return fogMulticastClients(data, row.sessclients);
+                },
+                targets: 2
+            },
+            {
+                render: function(data, type, row) {
+                    data = parseInt(data);
+                    return '<div class="progress progress-md active">'
+                        + '<div class="progress-bar progress-bar-success progress-bar-striped" role="progressbar" aria-valuenow="'
+                        + data
+                        + '" aria-valuemin="0" aria-valuemax="100" style="width:'
+                        + data
+                        + '%">'
+                        + data
+                        + '%</div>'
+                        + '</div>';
+                },
+                targets: 3
+            }
+        ],
+        serverSide: true,
+        ajax: {
+            url: '../management/index.php?node='
+            + Common.node
+            + '&sub=getSessionsList',
+            type: 'post'
+        }
+    });
+
+    sessionsTable.on('draw', function() {
+        sessionTableButtons(sessionsTable.rows({selected: true}));
+    });
+
+    if (Common.search && Common.search.length > 0) {
+        sessionsTable.search(Common.search).draw();
+    }
+
+    sessionModalConfirmBtn.on('click', function(e) {
+        var toRemove = $.getSelectedIds(sessionsTable),
+            method = sessionCancelBtn.attr('method'),
+            action = sessionCancelBtn.attr('action'),
+            opts = {
+                cancelconfirm: 1,
+                tasks: toRemove
+            };
+        $.apiCall(method, action, opts, function(err) {
+            sessionCancelBtn.prop('disabled', false);
+            if (err) {
+                return;
+            }
+            sessionModal.modal('hide');
+            sessionsTable.draw(false);
+            sessionsTable.rows({selected: true}).deselect();
+        });
+    });
+
+    sessionCancelBtn.on('click', function(e) {
+        sessionModal.modal('show');
+    });
+
+    // Enable the reload elements. (Auto refresh)
+    reload(null, false);
+    sessionCancelBtn.prop('disabled', true);
+    $.registerReloadToggle(sessionReloadToggle, {
+        onPause: function() {
+            clearTimeout(reloadinterval);
+        },
+        onResume: function() {
+            reload(null, false);
+        }
+    });
+})(jQuery);

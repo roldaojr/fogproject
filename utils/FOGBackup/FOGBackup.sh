@@ -25,7 +25,7 @@ while getopts "$optspec" o; do
                         usage
                         handleError "Path must be an existing directory" 8
                     fi
-                    backupPath=$OPTARG
+                    DB_backup_path=$OPTARG
                     ;;
                 no-database)
                     noBackupDB=1
@@ -56,7 +56,7 @@ while getopts "$optspec" o; do
                 usage
                 handleError "Path must be an existing directory" 8
             fi
-            backupPath=$OPTARG
+            DB_backup_path=$OPTARG
             ;;
         [Dd])
             noBackupDB=1
@@ -82,35 +82,34 @@ while getopts "$optspec" o; do
             ;;
     esac
 done
-if [[ -z $backupPath ]]; then
+if [[ -z ${DB_backup_path} ]]; then
     usage
     handleError "A path to backup the data must be set." 11
 fi
-if [[ ! -d $backupPath ]]; then
+if [[ ! -d ${DB_backup_path} ]]; then
     usage
     handleError "Path must be an existing directory" 8
 fi
 backupDate=$(date +"%Y%m%d");
-backupDir="$backupPath/$backupDate"
-cd $backupPath
+backupDir="${DB_backup_path}/$backupDate"
+cd ${DB_backup_path}
 countBackup=`ls | grep $backupDate | wc -l`
 backupDir="${backupDir}_$countBackup"
 [[ ! -d $backupDir ]] && mkdir -p $backupDir/{images,mysql,snapins,reports,logs} >/dev/null 2>&1
 backupDB() {
     dots "Backing up database"
-    # GH-314: this fetched management/export.php, which is not a database
-    # endpoint at all -- it calls checkAuthAndCSRF() and then exports whatever
-    # report is sitting in $_SESSION['foglastreport']. A plain wget satisfies
-    # neither the session nor the CSRF check, so the script died here and never
-    # reached reports, snapins or images.
+    # GH-314: this used to fetch management/export.php, which does not exist in
+    # 1.6, so the script died here before touching reports, snapins or images.
     #
-    # It could use maintenance/backup_db.php, but that endpoint is a plain
-    # unauthenticated database dump over HTTP, and building a second consumer
-    # on top of it is the wrong direction.
+    # It cannot use maintenance/backup_db.php either -- that is the endpoint the
+    # installer dumps through, but installfog.sh deletes the whole maintenance
+    # directory at the end of every run. It is an unauthenticated same-machine
+    # DB dump, so it is install scaffolding on purpose, not a runtime service,
+    # and keeping it installed to suit this script would be a poor trade.
     #
     # FOGBackup runs on the server and .fogsettings already carries the database
     # credentials, so dump directly. No web tier in the path also means a backup
-    # still works when the web tier is broken, which is when you most want one.
+    # still works when the web tier is broken -- which is when you most want one.
     if ! command -v mysqldump >/dev/null 2>&1; then
         echo "Failed"
         handleError "mysqldump is not installed, cannot back up the database" 19
@@ -122,14 +121,14 @@ backupDB() {
     local defaults escpass
     defaults=$(mktemp) || handleError "Could not create a temporary file" 20
     chmod 600 "$defaults"
-    escpass="${snmysqlpass//\\/\\\\}"
+    escpass="${DB_password//\\/\\\\}"
     escpass="${escpass//\"/\\\"}"
     printf '[client]\nhost=%s\nuser=%s\npassword="%s"\n' \
-        "${snmysqlhost:-localhost}" "$snmysqluser" "$escpass" > "$defaults"
+        "${DB_host:-localhost}" "${DB_user}" "$escpass" > "$defaults"
     # --single-transaction so a live server is not locked for the duration;
     # --quick so a large tasks/imaging history is streamed rather than buffered.
     mysqldump --defaults-extra-file="$defaults" --single-transaction --quick \
-        "${mysqldbname:-fog}" > "$backupDir/mysql/fog.sql" \
+        "${DB_name:-fog}" > "$backupDir/mysql/fog.sql" \
         2>>$backupDir/logs/error.log
     stat=$?
     rm -f "$defaults"
@@ -142,7 +141,7 @@ backupDB() {
     echo "Done"
 }
 backupImages() {
-    imageLocation=$storageLocation
+    imageLocation=${STORAGE_image_share_path}
     [[ ! -d $imageLocation ]] && handleError "Images location:$imageLocation does not exist on this server" 15
     dots "Backing up images"
     cp -auv $imageLocation $backupDir/images/ 2>>$backupDir/logs/error.log 1>>$backupDir/logs/progress.log 2>&1
@@ -154,7 +153,8 @@ backupImages() {
     echo "Done"
 }
 backupSnapins() {
-    [[ -z $snapinLocation ]] && snapinLocation='/opt/fog/snapins'
+    # GH-850: $fogprogramdir is resolved by lib/common/utils.sh, sourced above.
+    [[ -z $snapinLocation ]] && snapinLocation="$fogprogramdir/snapins"
     [[ ! -d $snapinLocation ]] && handleError "Snapins location:$snapinLocation does not exist on this server. Please add snapinLocation='/path/to/snapins' to .fogsettings." 16
     dots "Backing up snapins"
     cp -auv $snapinLocation/ $backupDir/snapins/ 2>>$backupDir/logs/error.log 1>>$backupDir/logs/progress.log 2>&1

@@ -18,15 +18,15 @@
  *
  * The runtime VALUE is unaffected -- PHP still coerces the null to '' -- so
  * every one of these sites has always produced the right answer, which is
- * exactly why the shape spread to 83 call sites without anyone noticing.
+ * exactly why the shape spread to 153 call sites without anyone noticing.
  * The cast is not a behavior change; it is the same coercion written down,
  * which is the same argument GH-1245 made about `sql_mode`.
  *
- * IT IS NOT ALWAYS COSMETIC, and forum topic 18232 is the proof -- reported
- * against this branch. `FOGPage::_tasking()` read `account` with a bare
- * `filter_input()` and no trim at all, so the null was not coerced by
- * anything -- it went straight into `Group::createImagePackage()`'s batch
- * insert and hit `tasks`.`taskPassreset`, which is NOT NULL:
+ * IT IS NOT ALWAYS COSMETIC, and forum topic 18232 is the proof. On
+ * dev-branch the tasking form read `account` with a bare `filter_input()`
+ * and no trim at all, so the null was not coerced by anything -- it went
+ * straight into `Group::createImagePackage()`'s batch insert and hit
+ * `tasks`.`taskPassreset`, which is NOT NULL:
  *
  *   SQLSTATE[23000]: 1048 Column 'taskPassreset' cannot be null
  *
@@ -96,13 +96,14 @@ $stringFns = array_flip(
 );
 
 $paths = [
-    '/packages/web/lib',
+    '/packages/web/src',
     '/packages/web/commons',
     '/packages/web/api',
     '/packages/web/management',
     '/packages/web/client',
     '/packages/web/maintenance',
     '/packages/web/status',
+    '/packages/web/lib/router',
     '/packages/service',
 ];
 

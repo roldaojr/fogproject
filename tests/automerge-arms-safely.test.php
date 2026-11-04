@@ -1,0 +1,175 @@
+<?php
+/**
+ * Auto-merge is armed at OPEN, and only where it is safe to arm it.
+ *
+ * The `working-1.6 pull request gate` ruleset sets the merge method to the
+ * merge queue, which makes merging two steps: green checks are only the
+ * precondition, and something still has to ASK before anything is enqueued.
+ * A pull request with all nine checks passing sits open forever if nobody
+ * asks, and that looks exactly like being stuck.
+ *
+ * .github/workflows/automerge.yml arms GitHub's own auto-merge when the pull
+ * request opens, so the enqueue happens without anyone coming back to press
+ * a button.
+ *
+ * That means a non-draft pull request MERGES ITSELF once green, so every
+ * guard below is load-bearing. Each assertion is one way this could quietly
+ * become wrong:
+ *
+ *   - the wrong merge method: the ruleset allows merge commits ONLY, and
+ *     asking for squash or rebase fails rather than falling back;
+ *   - a missing draft guard: the documented opt-out stops working and there
+ *     is no way to open a pull request without it merging itself;
+ *   - a missing ready_for_review trigger: taking a pull request OUT of draft
+ *     arms nothing, so the opt-out becomes a one-way door and the button is
+ *     back;
+ *   - a missing same-repo guard: a fork's token is read-only so this cannot
+ *     work anyway, and a fork's merge is a maintainer's decision;
+ *   - a widened base: stable must not start merging itself as a side
+ *     effect of this file;
+ *   - a missing gate check: on a base with no required checks, auto-merge
+ *     merges the moment a pull request opens.
+ *
+ * Static: this reads the workflow, so it needs no runner and no network.
+ *
+ * Usage: php tests/automerge-arms-safely.test.php
+ * Exit status 0 = pass, 1 = fail.
+ */
+
+$repo = dirname(__DIR__);
+$file = $repo . '/.github/workflows/automerge.yml';
+$src = is_file($file) ? (string)file_get_contents($file) : '';
+
+// Strip comments before asserting on any of this. The prose above the job
+// explains every guard and so NAMES each of them -- a file-wide search would
+// match the explanation with the guard itself deleted. That trap has already
+// bitten two tests in this tree.
+$code = (string)preg_replace('~^\s*\#.*$~m', '', $src);
+
+$results = [];
+
+$results[] = [
+    '' !== $src,
+    'the workflow exists at .github/workflows/automerge.yml',
+];
+
+// The ruleset allows merge commits only.
+$results[] = [
+    false !== strpos($code, '--merge')
+        && false === strpos($code, '--squash')
+        && false === strpos($code, '--rebase'),
+    'it asks for --merge, the only method the ruleset allows',
+];
+$results[] = [
+    false !== strpos($code, '--auto'),
+    'and arms auto-merge rather than merging on the spot',
+];
+
+// THE TOKEN. This is the one assertion here whose failure produces no error
+// anywhere -- the job goes green, auto-merge is armed, the pull request is
+// enqueued, and it then never merges.
+//
+// GitHub will not start a workflow run from an event caused by GITHUB_TOKEN.
+// The enqueue auto-merge performs is attributed to whoever armed it, so armed
+// with GITHUB_TOKEN the `merge_group` event starts nothing: the queue branch
+// is created, tests.yml never runs against it, no required context is ever
+// reported, and the entry sits in AWAITING_CHECKS until the ruleset's
+// 60-minute timeout ejects it.
+//
+// Observed on 2026-08-30: #1519/#1520/#1521 enqueued by hand dispatched in
+// seconds; #1522 and #1523 enqueued by this job never dispatched at all. The
+// only variable was who enqueued.
+//
+// An App token is exempt, which is why regen in tests.yml already mints one.
+$results[] = [
+    false === strpos($code, 'secrets.GITHUB_TOKEN'),
+    'it does not arm with GITHUB_TOKEN, whose enqueue can never trigger '
+        . 'the merge queue checks',
+];
+$results[] = [
+    false !== strpos($code, 'actions/create-github-app-token')
+        && (bool)preg_match(
+            '#GH_TOKEN:\s*\$\{\{\s*steps\.app-token\.outputs\.token#',
+            $code
+        ),
+    'it arms with the fog-workflows App token, which is exempt from the '
+        . 'anti-recursion rule',
+];
+
+// The draft opt-out, and the trigger that makes lifting it work.
+$results[] = [
+    (bool)preg_match('#!\s*github\.event\.pull_request\.draft#', $code),
+    'a draft is left alone, which is the documented way to hold one back',
+];
+$results[] = [
+    (bool)preg_match('#types:\s*\[[^\]]*ready_for_review#', $code),
+    'and ready_for_review is a trigger, so lifting the draft arms it '
+        . 'instead of being a one-way door',
+];
+
+// Scope. Same-repo, dev-branch only (it took working-1.6's ruleset at the
+// 1.6.0 release), long-lived heads excluded.
+$results[] = [
+    false !== strpos(
+        $code,
+        'github.event.pull_request.head.repo.full_name == github.repository'
+    ),
+    'only same-repo pull requests are armed',
+];
+$results[] = [
+    (bool)preg_match(
+        "#base\.ref\s*==\s*'dev-branch'#",
+        $code
+    ),
+    'only pull requests based on dev-branch, whose ruleset carries the '
+        . 'queue this works around',
+];
+// Arming waits only for REQUIRED checks, so on a base with none it merges
+// at once, untested (#2031 and #2033, at the 1.6.0 cut). The job must read
+// the base's enforced rules and refuse to arm without a required check.
+$results[] = [
+    (bool)preg_match('#rules/branches/\$BASE#', $code)
+        && (bool)preg_match('#required_status_checks#', $code)
+        && (bool)preg_match('#exit 1#', $code),
+    'it refuses to arm on a base that enforces no required check',
+];
+$results[] = [
+    (bool)preg_match('#contains\(fromJson\(.+stable.+dev-branch#', $code),
+    'and a long-lived head branch is excluded, so a release sync-back is '
+        . 'never armed',
+];
+
+// Arming must fail LOUDLY. continue-on-error hid a real failure on this
+// job's first ever run -- the step reported "success" while the command had
+// exited 1 -- and the job is not a required context, so a red mark on it
+// cannot block anything.
+$results[] = [
+    false === strpos($code, 'continue-on-error'),
+    'a failure to arm is visible rather than reported as success',
+];
+
+// contents: write is required by enablePullRequestAutoMerge; anything less
+// answers "Resource not accessible by integration". Pinned so it is not
+// "tidied" back to read by someone applying least privilege from first
+// principles, which is exactly the mistake that produced the failing run.
+$results[] = [
+    (bool)preg_match('#permissions:\s*\n\s*contents:\s*write#', $code),
+    'it holds the contents: write that enablePullRequestAutoMerge needs',
+];
+$results[] = [
+    (bool)preg_match('#pull-requests:\s*write#', $code)
+        && false === strpos($code, 'write-all'),
+    'and pull-requests: write, without reaching for write-all',
+];
+
+$failed = 0;
+foreach ($results as [$passed, $why]) {
+    echo $passed ? "  ok    $why\n" : "  FAIL  $why\n";
+    $failed += $passed ? 0 : 1;
+}
+echo "\n";
+if ($failed > 0) {
+    echo 'FAIL (' . $failed . ' of ' . count($results) . " assertions)\n";
+    exit(1);
+}
+echo 'PASS (' . count($results) . " assertions)\n";

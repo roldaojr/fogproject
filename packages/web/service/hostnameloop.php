@@ -11,6 +11,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Items\Host;
+
 /**
  * Hostname loop simply checks the host doesn't
  * already exist.
@@ -21,13 +25,22 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
 try {
     $host = $_REQUEST['host'];
     $host = trim($host);
     $host = base64_decode($host);
     $host = trim($host);
-    $Host = FOGCore::getClass('Host')
+    $Host = (new Host())
         ->set('name', $host)
         ->load('name');
     if ($Host->isValid()) {
@@ -37,10 +50,10 @@ try {
             _('The primary mac associated is'),
             $Host->get('mac')->__toString()
         );
-        throw new Exception($msg);
+        throw new \Exception($msg);
     }
     $msg = '#!ok';
-} catch (Exception $e) {
+} catch (\Exception $e) {
     $msg = $e->getMessage();
 }
 echo $msg;

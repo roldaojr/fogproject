@@ -127,7 +127,6 @@ class H(BaseHTTPRequestHandler):
             b = b'<!doctype html>\n<html><head><meta http-equiv="refresh" content="0;url=https://proxy.example/bp.html"/></head></html>'
             self.send_response(200); self.send_header('Content-Length', str(len(b))); self.end_headers()
             self.wfile.write(b)
-    do_GET = do_POST
     def log_message(self, *a): pass
 HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 PY
@@ -151,26 +150,25 @@ done
 
 # Everything registerStorageNode reaches for besides the POST. The existence
 # probe is answered by the same server, whose reply is never the literal
-# "exists", so the registration branch is always the one taken. It is wget on
-# this branch rather than curl, hence the timeout below -- an unanswered probe
-# would otherwise stall the whole section rather than fail it.
+# "exists", so the registration branch is always the one taken.
 cat > "$tmp/harness.sh" <<HARNESS
-httpproto=http
-ipaddress=127.0.0.1:$port
-webroot=/
-storageLocation=/images
+WEB_url_proto=http
+NET_fog_server_ip=127.0.0.1:$port
+WEB_root=/
+STORAGE_image_share_path=/images
 snapindir=/opt/fog/snapins
-sslpath=/opt/fog/snapins/ssl
-interface=eth0
-username=fogproject
-password=hunter2
+PKI_client_cert_dir=/opt/fog/snapins/ssl
+NET_interface=eth0
+SVC_user=fogproject
+SVC_password=hunter2
 maxClients=10
+_nodeRegistrationName() { echo "testnode"; }
 . "$tmp/under-test.sh"
 HARNESS
 
 run_mode() {
     echo "$1" > "$tmp/mode"
-    timeout 30 bash -c ". '$tmp/harness.sh'; $2" 2>&1
+    bash -c ". '$tmp/harness.sh'; $2" 2>&1
 }
 
 for mode in redirect proxy; do

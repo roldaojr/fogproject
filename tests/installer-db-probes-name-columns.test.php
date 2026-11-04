@@ -8,18 +8,20 @@
  * so a probe that fails for ANY other reason produces a prompt on a server
  * whose grants are perfectly correct, with nothing on screen to say why.
  *
- * It was a positional INSERT into taskLog, and schema 280 adds logType and
- * logText to that table, which would have made it error 1136, "Column count
- * doesn't match value count". 1.6 shipped that regression before catching it
- * (fogproject#1209) and had already been bitten once before by the same
- * statement (its schema 336 changed a column type under it). This branch gets
- * the repair and the gate together, so it is never bitten at all.
+ * It has broken that way twice, and both times the cause was the same
+ * positional INSERT against a table somebody else changed:
  *
- * Naming the columns is what makes it durable: a column added later takes its
- * default and the INSERT does not care. The failure is invisible in review --
- * `INSERT INTO x VALUES (...)` looks fine -- and invisible at install time on
- * any server that has not taken the schema change yet, which is why it is
- * worth a test rather than a comment.
+ *   schema 336 made taskLog.taskID an int(11); the marker '999test' in that
+ *     column became error 1265 under STRICT_TRANS_TABLES. Repaired by moving
+ *     the marker, which left the positional list in place;
+ *   schema 338 added taskLog.logType and taskLog.logText, so the six-value
+ *     list became error 1136, "Column count doesn't match value count".
+ *
+ * The repair that holds is naming the columns: a column added later takes its
+ * default and the INSERT does not care. This test is what makes the next
+ * schema step unable to reopen it -- the failure is invisible in review
+ * (`INSERT INTO x VALUES (...)` looks fine) and invisible at install time on
+ * any server that has not taken the schema change yet.
  *
  * Textual, because these are shell strings inside a 9000-line library; there
  * is nothing to execute without a database and a root password.
@@ -31,9 +33,10 @@
 $root = dirname(__DIR__);
 $src = file_get_contents($root . '/lib/common/functions.sh');
 
-$fails = array();
+$fails = [];
 $checks = 0;
 
+// Every INSERT INTO in the installer, with whatever follows the table name.
 preg_match_all(
     '#INSERT\s+INTO\s+(\S+?)\s*(\(|VALUES)#i',
     $src,
@@ -60,12 +63,14 @@ if ($checks < 1) {
         . ' testing anything and needs its pattern checked';
 }
 
-if (false === strpos($src, "999test")) {
+// The grant probe specifically: name it, so a rewrite that drops the probe
+// entirely does not silently pass the check above.
+if (false === strpos($src, "fog-install-probe")) {
     $fails[] = 'the fogstorage grant probe marker is gone; if the probe was'
         . ' replaced, point this test at whatever replaced it';
 }
 if (!preg_match(
-    '#INSERT INTO \$mysqldbname\.taskLog \([^)]*createdBy[^)]*\) VALUES#',
+    '#INSERT INTO \$\{DB_name\}\.taskLog \([^)]*createdBy[^)]*\) VALUES#',
     $src
 )) {
     $fails[] = 'the fogstorage grant probe no longer names its columns, which'

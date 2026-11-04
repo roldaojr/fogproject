@@ -2,24 +2,25 @@
 /**
  * An EXISTING server must be able to leave ?node=schema.
  *
- * Nothing on this branch checks that FOG_SCHEMA and commons/schema.php agree.
- * They do today -- 286 and 286 -- and there is no gate holding them there.
- * SchemaUpdaterPage::update() slices the step array from self::$mySchema, which
- * is 0 on a new database, so a fresh install executes every step from the
- * beginning and cannot see a disagreement at all. These are the expressions an
- * upgrade turns on and an install never does:
+ * Everything CI runs against the schema models a FRESH INSTALL. That is not a
+ * gap anyone chose; it is what the code makes easy. SchemaUpdaterPage::update()
+ * slices the step array from self::$mySchema, which is 0 on a new database, so
+ * a fresh install genuinely executes every step from the beginning -- and
+ * tests/schema-executes.test.php therefore sets $mySchema to 0 and FOG_SCHEMA
+ * to PHP_INT_MAX, which neutralises the two expressions an upgrade turns on:
  *
  *     $hasIndexed = count($this->schema) > self::$mySchema;
  *     $items      = $hasIndexed ? array_slice($this->schema, self::$mySchema, null, true) : [];
  *     ... foreach ($items as $version => $updates) { ... }
  *     $newSchema->set('version', $version + 1);
  *
- * The SQL is not the risk here. A server upgrading from version N runs steps
- * [0,N) then [N,end), which is the same statements in the same order a fresh
- * install runs. The risk is the arithmetic above and the version it leaves
- * behind, and that is what this replays: for every version a server could be
- * sitting on, run the updater's own expressions over the real step array and
- * require the stored version to land on FOG_SCHEMA.
+ * So the DATABASE side of an upgrade is already covered -- a server upgrading
+ * from version N runs steps [0,N) then [N,end), which is the same statements in
+ * the same order as a fresh install, and schema-executes runs exactly that. The
+ * uncovered surface is not the SQL. It is the arithmetic above and the version
+ * it leaves behind, and that is what this replays: for every version a server
+ * could be sitting on, run the updater's own expressions over the real step
+ * array and require the stored version to land on FOG_SCHEMA.
  *
  * Land below it and DatabaseManager::establish() goes on redirecting every
  * request to ?node=schema, while the updater reports "Update not required" --
@@ -27,31 +28,37 @@
  * so the page loops a Generic Error toast forever. There is no way out from the
  * browser: the page that would fix the server is the page that is stuck.
  *
- * THE BUG THIS CATCHES, which has already happened on the other branch.
- * working-1.6 #1338 appended seven UPDATE statements before commons/schema.php's
- * final `];` on the assumption that the file was one array. It is ~326 separate
- * `$this->schema[] = [...]` statements, so the seven joined the PREVIOUS step:
- * the element count did not move, FOG_SCHEMA was raised anyway, and every
- * existing server was left permanently on ?node=schema. Fresh installs were
- * correct throughout, because the statements still ran inside that last step --
- * which is why every CI check stayed green and it was found by a user.
+ * THE BUG THIS WOULD HAVE CAUGHT. #1338 appended seven UPDATE statements before
+ * commons/schema.php's final `];` on the assumption that the file was one
+ * array. It is ~326 separate `$this->schema[] = [...]` statements, so the seven
+ * joined the PREVIOUS step: the element count did not move, FOG_SCHEMA went
+ * 360 -> 367, and every existing server was left permanently on the schema
+ * page. Fresh installs were correct throughout, because the statements still
+ * ran inside that last step -- which is why all seven CI checks were green.
  *
- * This branch is where that would cost the most. 1.5.x was meant to be frozen
- * and keeps taking security-driven schema changes, so steps do still get
- * appended here, and the installed base upgrading into them is the largest FOG
- * has. Ported from working-1.6, where it runs alongside a second, textual gate
- * (tests/schema-gate.test.php) that this branch does not carry -- so here this
- * is the only thing pinning the invariant.
+ * WHY THIS COUNTS THE ARRAY WHEN tests/schema-gate.test.php COUNTS COMMENTS.
+ * schema-gate's docblock records that a real count "was tried and rejected"
+ * because schema.php "wants ~35 config constants and a couple of core classes,
+ * and every one of those is a thing an unrelated schema commit could add". That
+ * was true when it was written and is not any more:
+ * tests/lib/fog-schema-collector.php DISCOVERS both, so neither can be
+ * outgrown, and it has been executing this file in CI on three database engines
+ * since GH-1221.
  *
- * HOW IT COUNTS THE ARRAY. commons/schema.php is not a data file: it is a
- * method body, include'd from inside SchemaUpdaterPage::update(), and it wants
- * that method's context plus ~35 config constants and a couple of core classes.
- * tests/lib/fog-schema-collector.php DISCOVERS both rather than listing them --
- * constants by tokenising the file, classes by manufacturing them on demand --
- * so an unrelated schema commit adding either cannot break this test.
+ * The two gates are kept because they fail on different things and neither
+ * subsumes the other:
  *
- * Needs no database, deliberately: the upgrade-specific surface is arithmetic,
- * so this runs anywhere `sh tests/run-all.sh` runs.
+ *   schema-gate  compares FOG_SCHEMA to the highest `// N` label, and enforces
+ *                that labels and appends come in pairs. Textual, so it also
+ *                covers the label hygiene the collector cannot see.
+ *   this test    compares FOG_SCHEMA to the number of elements that actually
+ *                exist, which is label-independent. #1338 was invisible to the
+ *                label check until the header comment introducing its steps was
+ *                reworded -- a real count never needed telling.
+ *
+ * Needs no database, deliberately. The upgrade-specific surface is arithmetic,
+ * so this runs on the plain PHP matrix and BLOCKS, rather than riding the
+ * schema job where a failure would be one more tolerated leg.
  *
  * Usage: php tests/schema-upgrade-replay.test.php
  * Exit status 0 = pass, 1 = fail.
@@ -61,7 +68,7 @@ require __DIR__ . '/lib/fog-schema-collector.php';
 
 $root = dirname(__DIR__) . '/packages/web';
 $schemaFile = $root . '/commons/schema.php';
-$systemFile = $root . '/lib/fog/system.class.php';
+$systemFile = $root . '/src/Base/System.php';
 
 foreach ([$schemaFile, $systemFile] as $path) {
     if (!is_readable($path)) {
@@ -71,7 +78,9 @@ foreach ([$schemaFile, $systemFile] as $path) {
 }
 
 // Read from source rather than by booting System, whose constructor also
-// defines FOG_VERSION and FOG_CHANNEL and calls _versionCompare().
+// defines FOG_VERSION and FOG_CHANNEL and calls _versionCompare(). The same
+// regex tests/schema-gate.test.php uses, so the two cannot disagree about
+// what the constant says.
 $const = [];
 if (!preg_match(
     "/define\(\s*'FOG_SCHEMA'\s*,\s*(\d+)\s*\)/",

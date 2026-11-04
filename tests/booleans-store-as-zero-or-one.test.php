@@ -2,10 +2,9 @@
 /**
  * A PHP boolean must never reach a column as ''.
  *
- * Forum topic 18227, reported on 1.6.0-beta.4020 and present here too:
- * creating a snapin answers
+ * Forum topic 18227: creating a snapin on 1.6.0-beta.4020 answered
  * "SQLSTATE[01000]: Warning: 1265 Data truncated for column 'sShutdown' at
- * row 1". Snapin::save() has always written that column as
+ * row 1". The snapin pages have always written that column as
  *
  *     ->set('shutdown', $action == 'shutdown')
  *
@@ -15,7 +14,7 @@
  * with STRICT_TRANS_TABLES.
  *
  * It is GH-1245 arriving by a different door. save()'s emptyValueFor() only
- * recognises null and '' as empty, so a boolean walks past it untouched; and
+ * recognizes null and '' as empty, so a boolean walks past it untouched; and
  * the two builders in FOGManagerController called trim() first, which casts
  * before it trims, so false was already '' by the time it reached the binder.
  * The manager path is the one that ends every imaging task -- TaskQueue does
@@ -26,7 +25,7 @@
  * ->set() calls that currently pass a boolean would go green the moment
  * someone wrote another one, which is precisely how this arrived.
  *
- *   1. PDODB::_bind() normalises a boolean, as a STRING, before binding.
+ *   1. PDODB::_bind() normalizes a boolean, as a STRING, before binding.
  *   2. It does not reach for PDO::PARAM_BOOL/PARAM_INT to do it: bound as an
  *      integer, 0 against an ENUM is an *index*, and index 0 is the error
  *      value -- the same trap Schema::defaultLiteral() exists for.
@@ -36,9 +35,8 @@
  *      the boolean survives as far as the binder.
  *
  * DB-free: this reads the source, like insertbatch-required-columns. The
- * behaviour is proved against a live strict server, through the real ORM,
- * by background_scripts/prove_boolean_column_writes.php, run against the
- * 1.5 database.
+ * behavior is proved against a live strict server, through the real ORM,
+ * by background_scripts/prove_boolean_column_writes.php.
  *
  * Usage: php tests/booleans-store-as-zero-or-one.test.php
  * Exit status 0 = pass, 1 = fail.
@@ -89,20 +87,20 @@ function bStripComments($src)
 }
 
 $pdoSrc = bStripComments(
-    (string) file_get_contents("$root/packages/web/lib/db/pdodb.class.php")
+    (string) file_get_contents("$root/packages/web/src/Db/PDODB.php")
 );
 $manSrc = bStripComments(
     (string) file_get_contents(
-        "$root/packages/web/lib/fog/fogmanagercontroller.class.php"
+        "$root/packages/web/src/Base/FOGManagerController.php"
     )
 );
 $ctlSrc = bStripComments(
     (string) file_get_contents(
-        "$root/packages/web/lib/fog/fogcontroller.class.php"
+        "$root/packages/web/src/Base/FOGController.php"
     )
 );
 
-// --- 1. the binder normalises, and does it before bindValue() -------------
+// --- 1. the binder normalizes, and does it before bindValue() -------------
 $bindBody = '';
 if (preg_match(
     '#private static function _bind\([^)]*\)\s*\{(.*?)\n    \}#s',
@@ -128,9 +126,9 @@ bcheck(
     $checks
 );
 $boolPos = strpos($bindBody, 'is_bool($value)');
-$callPos = strpos($bindBody, 'bindParam(');
+$callPos = strpos($bindBody, 'bindValue(');
 bcheck(
-    'PDODB::_bind() normalises BEFORE it binds',
+    'PDODB::_bind() normalizes BEFORE it binds',
     $boolPos !== false && $callPos !== false && $boolPos < $callPos,
     $failures,
     $checks

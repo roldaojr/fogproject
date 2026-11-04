@@ -10,6 +10,12 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Audit\Audit;
+use FOG\Base\FOGCore;
+use FOG\Base\SmbiosIdentity;
+use FOG\Items\Inventory;
+
 /**
  * Inventory, stores the host inventory.
  *
@@ -19,6 +25,15 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
 header('Content-Type: text/plain');
 // The client base64-encodes every value, so decode (and sanitize) the
@@ -33,20 +48,33 @@ try {
     // host.
     FOGCore::getHostItem(false);
     if (!FOGCore::$Host->isValid()) {
-        throw new Exception(_('Invalid Host'));
+        throw new \Exception(_('Invalid Host'));
     }
+    // Before the fields are set, so the auditChange rows carry what moved.
+    // On a re-inventory that is the whole point: a swapped disk, a changed
+    // serial or a machine that came back as different hardware is exactly
+    // the kind of thing this endpoint is asked about after the fact, and
+    // the inventory row itself only ever holds the latest answer.
+    Audit::record([
+        'type' => 'host.inventory',
+        'authSource' => Audit::SOURCE_ANONYMOUS,
+        'subjectType' => 'host',
+        'subjectID' => (int)FOGCore::$Host->get('id'),
+        'subjectLabel' => (string)FOGCore::$Host->get('name'),
+        'renderable' => 1
+    ]);
     $Inventory = FOGCore::$Host->get('inventory');
     if (!$Inventory instanceof Inventory
         || !$Inventory->isValid()
     ) {
-        $Inventory = FOGCore::getClass('Inventory')
+        $Inventory = (new Inventory())
             ->set('hostID', FOGCore::$Host->get('id'));
     }
     // Explicit allowlist of fields a client is permitted to write. Server
     // managed fields (id, hostID, createdTime, deleteDate) are intentionally
     // excluded so a request cannot overwrite a different inventory row or
     // reassign this inventory to another host via mass-assignment.
-    $allowedFields = array(
+    $allowedFields = [
         'primaryUser',
         'other1',
         'other2',
@@ -75,12 +103,20 @@ try {
         'caseasset',
         'gpuvendors',
         'gpuproducts',
-    );
+    ];
+    // Identifier fields that may be matched against iPXE/SMBIOS values at
+    // boot time. Canonicalize on write so the stored value compares
+    // reliably with what iPXE reports (see SmbiosIdentity::canonicalize).
+    $identifierFields = ['sysuuid', 'sysserial', 'mbserial'];
     foreach ($allowedFields as $field) {
         if (!isset($_REQUEST[$field])) {
             continue;
         }
-        $Inventory->set($field, $_REQUEST[$field]);
+        $value = $_REQUEST[$field];
+        if (in_array($field, $identifierFields, true)) {
+            $value = SmbiosIdentity::canonicalize($value);
+        }
+        $Inventory->set($field, $value);
     }
     // hdinfo is a compound string that is parsed out into separate columns.
     if (isset($_REQUEST['hdinfo'])) {
@@ -127,12 +163,13 @@ try {
             ->set('hdserial', $hdserial);
     }
     if (!$Inventory->save()) {
-        throw new Exception(
+        Audit::markOutcome(Audit::FAILED, 'inventory save failed');
+        throw new \Exception(
             _('Failed to create inventory for this host')
         );
     }
     echo _('Done');
-} catch (Exception $e) {
+} catch (\Exception $e) {
     echo Initiator::e($e->getMessage());
 }
 exit;

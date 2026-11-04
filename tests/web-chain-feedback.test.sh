@@ -1,0 +1,155 @@
+#!/bin/bash
+#
+# Guards the served TLS chain against feeding on its own output.
+#
+#   tests/web-chain-feedback.test.sh
+#
+# _writeWebChainFiles() assembles what the web server sends: the leaf from
+# ${PKI_web_vhost_cert}, then the intermediates out of ${PKI_web_trust_chain}, into
+# pki/web/leaf/.webFullChain.pem. The vhost is pointed at that bundle.
+#
+# Which meant the bundle was reachable as an INPUT. createSSLCA() adopts
+# whatever certificate path the live vhost names, via
+# _detectExternalCertManagement() signal 2 -- "the vhost serves a leaf from
+# outside FOG's own paths, so the admin must manage it". That test only knew
+# about ${PKI_client_cert_dir}, and the zoned PKI had long since moved FOG's own web leaf to
+# $fogprogramdir/pki/web/leaf. So on an ordinary FOG-issued HTTPS server the
+# signal fired on FOG's own file, recorded acmeLeaf=yes, and set
+# ${PKI_web_vhost_cert}=.webFullChain.pem. From then on
+#
+#     cat "${PKI_web_vhost_cert}" "$chainonly" > fullchain.new
+#
+# appended one more copy of the intermediate on every install. Observed live at
+# fourteen certificates: leaf + 13 identical "CN=FOG Web CA".
+#
+# Browsers tolerate that. iPXE does not -- it validates pairwise from the
+# trusted root upwards (crypto/x509.c), so copy 2 is checked against copy 1 as
+# its issuer, fails x509_check_issuer, and every HTTPS netboot dies at
+# boot.php. Nothing server-side says why.
+#
+# Three fixes, all pinned here: the detector knows the PKI tree is FOG's, the
+# assembler reads only the leaf out of ${PKI_web_vhost_cert}, and _resolveWebLeafPaths()
+# repoints an ${PKI_web_vhost_cert} that names the derived bundle -- while leaving an
+# admin's own fullchain.pem alone, because that is a supported value.
+#
+# Needs openssl. Runs on generated fixtures -- no install, no network, no root.
+#
+# Exit status 0 = pass or skip, 1 = fail.
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+FUNCS="$REPO/lib/common/functions.sh"
+
+[[ -f $FUNCS ]] || { echo "ERROR: $FUNCS not found" >&2; exit 1; }
+command -v openssl >/dev/null 2>&1 || { echo "SKIP: openssl is not installed"; exit 0; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+ok()  { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
+bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; }
+is()  { [[ "$1" == "$2" ]] && ok "$3" || bad "$3 (expected '$2', got '$1')"; }
+
+error_log="$WORK/error.log"
+: > "$error_log"
+# shellcheck source=/dev/null
+. "$FUNCS" >/dev/null 2>&1
+dots() { :; }
+errorStat() { :; }
+
+# --- fixture: root -> intermediate -> leaf, the shape FOG issues -------------
+fogprogramdir="$WORK/opt/fog"
+# The tree lives at /etc/fog/pki on a real install. Point it inside the
+# scratch $fogprogramdir instead, or every case below would reach for the
+# host's own /etc/fog -- and _migratePkiTree would try to CREATE it.
+PKI_root_dir="$fogprogramdir/pki"
+PKI_client_cert_dir="$WORK/opt/fog/snapins/ssl"
+webdirdest="$WORK/var/www/fog"
+leafdir="$fogprogramdir/pki/web/leaf"
+cadir="$fogprogramdir/pki/web/ca"
+mkdir -p "$leafdir" "$cadir" "${PKI_client_cert_dir}" "$webdirdest/management/other/ssl"
+
+openssl req -x509 -new -nodes -newkey rsa:2048 -sha256 -days 30 \
+    -subj "/CN=FOG Server CA" -keyout "$cadir/root.key" -out "$cadir/root.pem" \
+    >/dev/null 2>&1 || { echo "ERROR: fixture root CA failed" >&2; exit 1; }
+openssl req -new -nodes -newkey rsa:2048 -sha256 -subj "/CN=FOG Web CA" \
+    -keyout "$cadir/.fogWebCA.key" -out "$cadir/int.csr" >/dev/null 2>&1
+printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n' \
+    > "$cadir/int.ext"
+openssl x509 -req -in "$cadir/int.csr" -CA "$cadir/root.pem" -CAkey "$cadir/root.key" \
+    -CAcreateserial -sha256 -days 30 -extfile "$cadir/int.ext" \
+    -out "$cadir/.fogWebCA.pem" >/dev/null 2>&1
+openssl req -new -nodes -newkey rsa:2048 -sha256 -subj "/CN=fogserver" \
+    -keyout "$leafdir/.webLeaf.key" -out "$leafdir/leaf.csr" >/dev/null 2>&1
+openssl x509 -req -in "$leafdir/leaf.csr" -CA "$cadir/.fogWebCA.pem" \
+    -CAkey "$cadir/.fogWebCA.key" -CAcreateserial -sha256 -days 30 \
+    -out "$leafdir/.webLeaf.pem" >/dev/null 2>&1
+
+# root+intermediate, the shape createWebIntermediateCA writes.
+PKI_web_trust_chain="$cadir/.fogWebCAchain.pem"
+cat "$cadir/.fogWebCA.pem" "$cadir/root.pem" > "${PKI_web_trust_chain}"
+
+PKI_web_vhost_key="$leafdir/.webLeaf.key"
+fullchain="$leafdir/.webFullChain.pem"
+
+ncerts() { grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null; }
+
+echo "web chain feedback:"
+
+# --- the assembler, run over and over ----------------------------------------
+PKI_web_vhost_cert="$leafdir/.webLeaf.pem"
+_writeWebChainFiles
+is "$(ncerts "$fullchain")" "2" "a normal run assembles leaf + intermediate"
+
+# THE REGRESSION. ${PKI_web_vhost_cert} names the bundle this function writes, which is
+# what createSSLCA() adopted from the vhost on every FOG-issued HTTPS server.
+PKI_web_vhost_cert="$fullchain"
+for _ in 1 2 3 4 5; do _writeWebChainFiles; done
+is "$(ncerts "$fullchain")" "2" "five runs against its own output stay at leaf + intermediate"
+# -nameopt RFC2253 pins the formatting. Without it openssl prints whatever its
+# own default is, and that is not stable across versions: 3.0.13 (ubuntu-24.04,
+# which is what the CI runner has) prints "subject=CN = fogserver" with spaces,
+# 3.5.7 prints "subject=CN=fogserver" without them. The test passed on the
+# machine it was written on and failed on the runner -- invisibly, because
+# `run-all.sh | tee` was discarding the suite's exit status until fog-workflows
+# GH-27. RFC2253 is a specified format rather than a default, so both agree.
+is "$(openssl x509 -in "$fullchain" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+   "subject=CN=fogserver" "the leaf is still first in the bundle"
+
+# An already-grown bundle collapses rather than needing a migration.
+{ openssl x509 -in "$leafdir/.webLeaf.pem"
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13; do openssl x509 -in "$cadir/.fogWebCA.pem"; done
+} > "$fullchain" 2>/dev/null
+is "$(ncerts "$fullchain")" "14" "fixture reproduces the live 14-certificate bundle"
+_writeWebChainFiles
+is "$(ncerts "$fullchain")" "2" "the next run collapses a grown bundle back"
+
+# --- the cause: FOG's own PKI tree is not evidence of an external cert -------
+etcconf="$WORK/fog.conf"
+PKI_root_ca_cert="$cadir/root.pem"
+PKI_web_vhost_cert="$leafdir/.webLeaf.pem"
+
+echo "    ssl_certificate ${fullchain};" > "$etcconf"
+_detectExternalCertManagement >/dev/null 2>&1
+is "$?" "1" "a vhost serving FOG's own pki/ leaf is not external"
+
+echo "    ssl_certificate /etc/letsencrypt/live/fog/fullchain.pem;" > "$etcconf"
+_detectExternalCertManagement >/dev/null 2>&1
+is "$?" "0" "a vhost serving someone else's leaf still is external"
+
+# --- and the input stops naming the output ----------------------------------
+PKI_web_vhost_cert="$fullchain"
+_resolveWebLeafPaths
+is "${PKI_web_vhost_cert}" "$leafdir/.webLeaf.pem" "an \${PKI_web_vhost_cert} naming the derived bundle is repointed"
+
+PKI_web_vhost_cert="/etc/letsencrypt/live/fog/fullchain.pem"
+_resolveWebLeafPaths
+is "${PKI_web_vhost_cert}" "/etc/letsencrypt/live/fog/fullchain.pem" \
+    "an ACME client's own fullchain is left alone"
+
+echo
+echo "  passed: $PASS  failed: $FAIL"
+[[ $FAIL -eq 0 ]] || exit 1
+exit 0

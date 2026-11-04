@@ -1,0 +1,218 @@
+<?php
+/**
+ * The Run History report is wired to ActivityWindow, and to the right gate.
+ *
+ * ADR 0022 decision 4 shipped ActivityWindow with no caller, which the ADR
+ * itself flagged as the thing most likely to let it rot. This is the caller,
+ * and the parts of the wiring that fail SILENTLY are what this pins:
+ *
+ *   - the report is discovered by FILENAME. src/Reports/*.php becomes
+ *     a menu entry with underscores turned into spaces, so the file name,
+ *     the class name, the `f` parameter the JS switches on and the
+ *     REPORT_NODES key all have to agree. Any one of them out of step gives
+ *     a menu entry that opens an empty page, with no error anywhere.
+ *   - the column keys getList() emits must match the ones the DataTables
+ *     definition asks for. A mismatch renders blank cells, not an error.
+ *   - the permission. Reports share the `report` node by default, which is
+ *     the defect ADR 0023 opens with; this one is task activity and must
+ *     resolve to `task`. Getting that wrong widens access silently.
+ *   - the menu label must be a row in ReportManagement::reportTitles(),
+ *     because a label built from the file name at runtime is a msgid
+ *     xgettext never sees and a spelling nobody chose.
+ *
+ * What this canNOT check is that getList() RUNS. It did not, the first time:
+ * `TaskStateManager->find()` does not exist in 1.6 and a call to it is a
+ * fatal that looks entirely plausible in a diff. That, and the timezone bug
+ * underneath it, are covered by
+ * /home/telliott/labs/adr0020/prove_runhistory.php against a lab database.
+ *
+ * Usage: php tests/run-history-report.test.php
+ * Exit status 0 = pass, 1 = fail.
+ */
+
+require __DIR__ . '/lib/fog-test-harness.php';
+
+FogTestHarness::boot('run-history');
+FogTestHarness::fakeDb();
+
+$t = new FogChecks();
+$web = dirname(__DIR__) . '/packages/web';
+$report = $web . '/src/Reports/Run_History.php';
+
+$t->check('the report file exists', is_readable($report));
+$src = is_readable($report) ? file_get_contents($report) : '';
+
+/*
+ * 1. The four names that have to agree.
+ *
+ * basename minus '.php', underscores to spaces, is the menu label
+ * and the `f` parameter; the same string underscored is the REPORT_NODES
+ * key; the class name matches the file for the autoloader.
+ */
+$slug = 'run_history';
+$label = str_replace('_', ' ', $slug);
+$t->check(
+    'the class name matches the file name, so the autoloader finds it',
+    class_exists('FOG\Reports\Run_History')
+);
+$t->check(
+    'it extends ReportManagement, so it appears in the report menu at all',
+    class_exists('FOG\Reports\Run_History')
+    && is_subclass_of('FOG\Reports\Run_History', 'FOG\Pages\ReportManagement')
+);
+$js = file_get_contents($web . '/management/js/fog/report/fog.report.file.js');
+$t->check(
+    "the JS switches on '$label', which is what the filename decodes to",
+    false !== strpos($js, "case '" . $label . "':")
+);
+
+/*
+ * 2. The columns. getList() emits an associative row; the JS names each key
+ *    it wants. Both lists are read out of the source rather than assumed,
+ *    so adding a column to one and not the other fails here.
+ */
+$wanted = [];
+$at = strpos($js, "case '" . $label . "':");
+if (false !== $at) {
+    $block = substr($js, $at, strpos($js, 'break;', $at) - $at);
+    // The key only; a column may also carry a render, and every one of
+    // these now does -- run labels come off the network and DataTables
+    // writes cell data as HTML without one.
+    if (preg_match_all("/\{data: '([a-zA-Z]+)'/", $block, $m)) {
+        $wanted = $m[1];
+    }
+}
+$t->check('the JS names its columns', count($wanted) > 0);
+foreach ($wanted as $col) {
+    $t->check(
+        "getList() emits the '$col' key the grid asks for",
+        false !== strpos($src, "'" . $col . "' =>")
+    );
+}
+$t->check(
+    'the table id in the JS is the one the page renders',
+    false !== strpos($js, "#runhistory-table")
+    && false !== strpos($src, "'runhistory-table'")
+);
+$t->check(
+    'the header row has one cell per column',
+    count($wanted) === substr_count(
+        substr($src, strpos($src, '$this->headerData'), 400),
+        '_('
+    )
+);
+
+/*
+ * 3. The gate. This is the one that fails dangerously rather than visibly.
+ */
+$nodes = constant('FOG\Auth\Authorization::REPORT_NODES');
+$t->check(
+    'the report is listed in REPORT_NODES rather than inheriting `report`',
+    array_key_exists($slug, (array)$nodes)
+);
+$t->check(
+    'and it resolves to `task`, where Task Management gates the same rows',
+    'task' === ($nodes[$slug] ?? null)
+);
+
+/*
+ * 4. The menu label is a row in ReportManagement's map rather than
+ *    ucwords() of the file name -- which is also what keeps the msgid in
+ *    the catalog, since a runtime-built one never reaches it.
+ */
+$titles = \FOG\Pages\ReportManagement::reportTitles();
+$t->check(
+    'the menu label comes from ReportManagement::reportTitles()',
+    ($titles['run history'] ?? '') === _('Run History')
+);
+
+/*
+ * 5. It really does read ActivityWindow, and reads it the bounded way.
+ */
+$t->check(
+    'getList() goes through ActivityWindow::between()',
+    false !== strpos($src, 'ActivityWindow::between(')
+);
+$t->check(
+    'the source list is whitelisted against ActivityWindow::sources()',
+    false !== strpos($src, 'ActivityWindow::sources()')
+);
+$t->check(
+    'no per-row object lookup: hosts are resolved in one query',
+    false !== strpos($src, 'WHERE `hostID` IN (')
+    && false === strpos($src, "getClass('Host', ")
+);
+$t->check(
+    'the host id list is cast to int before it is interpolated',
+    false !== strpos($src, "array_map('intval', \$hostIDs)")
+);
+
+/*
+ * 6. The window is built on FOG's clock.
+ *
+ * The columns compared are stamped by save() through niceDate(), which uses
+ * the configured timezone. A bound built with PHP's date() is silently
+ * offset by however far apart the two are -- BETWEEN matches a shifted
+ * window and answers a question nobody asked. Found in the lab, where the
+ * two clocks were five hours apart and a task created seconds earlier did
+ * not appear in a window ending "now".
+ *
+ * The parsing moved to ReportWindow when the Imaging Report needed the same
+ * three decisions (ADR 0030 decision 1), so the rules are pinned THERE and
+ * what is pinned here is that this report still goes through it. Pinning
+ * only the delegation would leave the rules unguarded; pinning only the
+ * class would not notice this report growing its own copy back.
+ *
+ * The two branches of each bound are on DIFFERENT clocks, and that is the
+ * point rather than an inconsistency. A default is the server saying "now"
+ * and "a fortnight before now", which has no viewer in it and so is read in
+ * the storage zone. A supplied bound was typed by somebody reading a page
+ * rendered in THEIR zone, so it is read in that one -- viewerDate(), which
+ * is a no-op for every account that has not chosen a display zone.
+ */
+$window = $web . '/src/Audit/ReportWindow.php';
+$t->check('the shared window parser exists', is_readable($window));
+$wsrc = is_readable($window) ? file_get_contents($window) : '';
+// Both bounds, anchored as whole expressions including BOTH branches. A
+// substring search for `self::niceDate()` is satisfied by one branch alone,
+// so swapping only the other to PHP's clock -- which is exactly the
+// half-shifted window the lab found -- would pass it.
+$t->check(
+    'the END bound is FOG\'s clock by default, the viewer\'s when given',
+    1 === preg_match(
+        "/\\\$end = '' === \\\$given\['end'\]\s*\?\s*self::niceDate\(\)"
+        . "\s*:\s*self::viewerDate\(\\\$given\['end'\]\);/",
+        $wsrc
+    )
+);
+$t->check(
+    'and so is the START bound, default included',
+    1 === preg_match(
+        "/\\\$start = '' === \\\$given\['start'\]\s*\?\s*"
+        . "self::niceDate\(\)->modify\(.*?\)\s*:\s*"
+        . "self::viewerDate\(\\\$given\['start'\]\);/s",
+        $wsrc
+    )
+);
+$t->check(
+    'and no bound is constructed on PHP\'s clock instead',
+    false === strpos($wsrc, 'new \DateTime')
+    && false === strpos($wsrc, 'new \DateTimeImmutable')
+    && 1 !== preg_match('/[^_a-z]date\(/', $wsrc)
+    && 1 !== preg_match('/[^_a-z]time\(\)/', $wsrc)
+);
+$t->check(
+    'a malformed bound is dropped rather than passed to BETWEEN',
+    false !== strpos($wsrc, 'false === strtotime($v)')
+);
+$t->check(
+    'reversed bounds are swapped rather than returned empty',
+    false !== strpos($wsrc, 'if ($start > $end)')
+);
+$t->check(
+    'this report reads its window through that parser, not its own copy',
+    false !== strpos($src, 'ReportWindow::stringsFromRequest(')
+    && false === strpos($src, 'strtotime($v)')
+);
+
+$t->finish();

@@ -10,6 +10,9 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\TaskHandling\TaskingElement;
+
 /**
  * Returns a listing of all snapins in the system.
  *
@@ -19,34 +22,14 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
-try {
-    $snapinCount = FOGCore::getClass('SnapinManager')
-        ->count();
-    if ($snapinCount < 1) {
-        throw new Exception(
-            _('There are no snapins on this server')
-        );
-    }
-    $snapinids = FOGCore::getSubObjectIDs('Snapin');
-    $snapinnames = FOGCore::getSubObjectIDs(
-        'Snapin',
-        array('id' => $snapinids),
-        'name'
-    );
-    foreach ((array)$snapinids as $index => $snapinid) {
-        printf(
-            '\tID# %d\t-\t%s\n',
-            $snapinid,
-            $snapinnames[$index]
-        );
-        unset(
-            $snapinid,
-            $snapinnames[$index],
-            $snapinids[$index]
-        );
-    }
-} catch (Exception $e) {
-    echo $e->getMessage();
-}
-exit;
+TaskingElement::getlisting('snapin');

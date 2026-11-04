@@ -2,23 +2,25 @@
 /**
  * Route::cancel() must not report work it did not do.
  *
- * Every arm of this method had a path that returned normally -- and so 200 --
- * having changed nothing, or that died partway with an error saying nothing
- * about the actual situation:
+ * Every arm of this method used to have a path that returned normally --
+ * and therefore 200 -- while changing nothing, or while changing far more
+ * than was asked:
  *
  *  - a task in a finished state fell out of the state test and answered
- *    "cancelled" with its state untouched;
- *  - Host::loadTask() sets its field to `new Task(null)` when nothing is
- *    running, and that IS `instanceof Task`, so the guard was true for every
- *    host and cancel() went on to save a Task with no typeID. save() throws,
- *    and cancel() has no catch -- so one idle member of a group aborted the
- *    whole loop and every host after it kept its task running;
- *  - scheduledtask carries isActive rather than stateID, so it failed a test
- *    it could never pass: that endpoint has never cancelled anything.
+ *    "canceled" with its state untouched (the reason this file exists: a
+ *    Failed task did exactly that);
+ *  - a group canceled by no state filter at all and by a paginated listing,
+ *    so whatever came back was canceled whatever state it was in -- and the
+ *    listing covers every task the member hosts have ever run;
+ *  - a host with nothing running reached Task::save() on an empty Task and
+ *    answered 406 "Required database field is empty: typeID";
+ *  - scheduledtask carries no stateID, so it failed a test it could never
+ *    pass and the endpoint never once canceled a scheduled task;
+ *  - filedeletequeue has no model cancel(), so a valid id raised an Error,
+ *    which is not an \Exception and so escaped the catch as a bodyless 500.
  *
- * Ported from working-1.6. Narrower here by fact, not by choice: 1.5 has no
- * filedeletequeue among its tasking classes and no OpenAPI document, so the
- * two assertions covering those have nothing to bind to.
+ * All five are silent in exactly the same way: the caller is told the
+ * resource was dealt with. That is what this gate pins.
  *
  * Usage: php tests/cancel-route-reports-truthfully.test.php
  * Exit status 0 = pass, 1 = fail.
@@ -27,12 +29,13 @@
 $root = dirname(__DIR__);
 $web = $root . '/packages/web';
 
-$route = file_get_contents($web . '/lib/router/route.class.php');
+$route = file_get_contents($web . '/src/Router/Route.php');
+$openapi = file_get_contents($web . '/src/Router/OpenAPI.php');
 
-$fails = array();
+$fails = [];
 
-// Isolate cancel() so a match elsewhere in this class cannot stand in for the
-// thing being tested.
+// Isolate cancel() so a match elsewhere in this 5000-line class cannot
+// stand in for the thing being tested.
 if (!preg_match(
     '#public static function cancel\(\$class, \$id\).*?\n    \}\n#s',
     $route,
@@ -45,8 +48,12 @@ $cancel = $m[0];
 
 // ------------------------------------------------- the requested resource
 
-// Bounded to the helper's own body: an open-ended match finds json_encode
-// somewhere else in the file and passes a mutation that removed it.
+// The 409 helper, and that it is what the arms call. Reached through
+// sendResponse() directly the body would be a bare string under a JSON
+// content type, which is the older shape this deliberately does not copy.
+// Bounded to the helper's own body. An unbounded `.*?` here happily found
+// json_encode somewhere else in the 5000 lines below and passed a mutation
+// that removed it.
 if (!preg_match(
     '#private static function _notCancellable\(\$msg\)\s*\{(.*?)\n    \}#s',
     $route,
@@ -69,59 +76,114 @@ if (!preg_match(
     $cancel
 )) {
     $fails[] = 'a named task outside the active states does not answer 409,'
-        . ' so cancelling a Complete or Cancelled task reports success';
+        . ' so canceling a Complete/Canceled/Failed task reports success';
 }
 
-// ------------------------------------------------------- the empty Task
+// ------------------------------------------------------------- the group
 
-// Both arms, because they fail identically and were fixed together. The
-// group arm is the worse of the two: it aborts a loop it is halfway through.
-if (substr_count($cancel, '$Task->isValid()') < 2) {
-    $fails[] = 'the host and group arms do not both test the loaded task for'
-        . ' validity -- instanceof alone is true for the empty Task that'
-        . ' Host::loadTask() leaves behind, so an idle host tries to save it';
+// The state filter is the whole fix. Without it the arm cancels whatever the
+// listing hands it: the same host filter matches 29 rows for group 2 on the
+// development server, none of them active.
+if (!preg_match(
+    '#case \'group\':.*?getIds\(\s*\'task\',\s*\[\s*\'hostID\'[^\]]*?\'stateID\' => \$states#s',
+    $cancel
+)) {
+    $fails[] = 'the group arm does not filter its task ids by state, so'
+        . ' canceling a group rewrites every task its hosts ever ran';
 }
-// Bounded to the group arm. Left open-ended, the match ran on and found the
-// host arm's refusal, so dropping the group's own was invisible.
-if (!preg_match('#case \'group\':(.*?)\n                break;#s', $cancel, $grp)) {
+// listem() is paginated, so it was also the reason only one page of the
+// intended work happened. Reading ids has no page.
+if (false !== strpos($cancel, 'Route::listem(')) {
+    $fails[] = 'the group arm still reads tasks through listem(), whose'
+        . ' response is a paginated envelope, so it cancels one page';
+}
+// The CONDITION, not just the presence of the refusal: pinning only the call
+// leaves `if (false) { self::_notCancellable(...) }` passing, with the
+// refusal still in the source and no longer able to happen.
+if (!preg_match('#case \'group\':(.*?)\n                    break;#s', $cancel, $grp)) {
     $fails[] = 'the group arm is not where this gate can see it';
-} elseif (false === strpos($grp[1], '$cancelled++')
-    || !preg_match(
-        '#if \(\$cancelled\s*<\s*1\)\s*\{\s*self::_notCancellable#s',
-        $grp[1]
-    )
-) {
-    // The CONDITION, not just the presence of the call. Pinning only the
-    // call left `if (false) { self::_notCancellable(...) }` passing -- the
-    // refusal was still in the source and could no longer happen.
-    $fails[] = 'the group arm does not count what it cancelled and refuse on'
-        . ' zero, so a group with nothing running still reports success';
+} elseif (!preg_match(
+    '#if \(count\(\$taskIDs\)\s*<\s*1\)\s*\{\s*self::_notCancellable#s',
+    $grp[1]
+)) {
+    $fails[] = 'a group with no active tasks does not answer 409, so'
+        . ' canceling an idle group reports success';
 }
 
-// ------------------------------------------------------- scheduledtask
+// --------------------------------------------------------------- the host
 
-// It has no stateID at all, so it can only ever be handled by an arm of its
-// own.
+// Host::loadTask() sets the field to `new Task(null)` when nothing is
+// running, and that IS instanceof Task -- so instanceof alone is always
+// true and proves nothing.
+if (!preg_match('#\$Task->isValid\(\)#', $cancel)) {
+    $fails[] = 'the host arm does not test the loaded task for validity, so'
+        . ' an idle host tries to save an empty Task';
+}
+
+// ------------------------------------------------- the two silent classes
+
+// scheduledtask has isActive, not stateID, so it can only ever be handled
+// by an arm of its own.
 if (!preg_match('#case \'scheduledtask\':.*?\$class->cancel\(\)#s', $cancel)) {
     $fails[] = 'scheduledtask has no arm of its own, so it falls into the'
         . ' state test it cannot pass and the endpoint cancels nothing';
 }
 
-// ---------------------------------------------------- the bulk arm is not
-
-// The search-driven arm is a filter, and matching nothing is a legitimate
-// result for one. If this starts refusing, the 409 has spread from "you
-// named a thing I did not touch" to "your filter was empty".
+// filedeletequeue is the one tasking class with no model cancel(), so the
+// manager is the only implementation there is.
 if (!preg_match(
-    '#\$find\[\'stateID\'\] = \$states;(.*?)\n                \} else \{#s',
-    $cancel,
-    $bulk
+    '#case \'filedeletequeue\':.*?getManager\(\)->cancel\(#s',
+    $cancel
 )) {
-    $fails[] = 'the search-driven bulk arm is not where this gate can see it,'
-        . ' so nothing checks that it still answers 200 on an empty filter';
-} elseif (false !== strpos($bulk[1], '_notCancellable')) {
-    $fails[] = 'the search-driven bulk arm now refuses an empty filter result;'
-        . ' matching no rows is a legitimate outcome for a filter';
+    $fails[] = 'filedeletequeue does not cancel through its manager, and it'
+        . ' has no model cancel() -- the call raises an uncatchable Error';
+}
+
+// ------------------------------------------------------------ no bulk arm
+
+// A cancel names one object. The search-driven bulk arm read an invalid
+// object as "no id given", so a missing id canceled every active row, and an
+// empty body did the same on purpose (GH-1949). It must not come back.
+if (false !== strpos($cancel, 'getsearchbody(')) {
+    $fails[] = 'cancel() searches the request body again; a cancel must name'
+        . ' one object, never a filter (GH-1949)';
+}
+
+// ------------------------------------------------------------- the document
+
+// A route that answers a status the spec does not list is a route whose
+// consumers cannot handle it.
+//
+// Delete answers 409 as well now, for an unrelated reason (ADR 0031: a
+// foreign key still refers to the row), which is why the helper takes its
+// description from the caller. That does NOT make 409 general: it still
+// belongs on the two operations that can return it and not in the shared
+// _errorResponses() map, which is what the third check below holds.
+if (!preg_match(
+    '#private static function _conflictResponse\(\$description.*?\'409\'#s',
+    $openapi
+)) {
+    $fails[] = 'openapi.class.php has no 409 response helper';
+}
+// Bounded to that one path entry, for the same reason as the helper above:
+// _conflictResponse() is defined later in this file, so an open-ended match
+// finds its own definition and passes whatever the cancel path says.
+if (!preg_match(
+    "#'/\{id\}/cancel'\] = \[(.*?)\n            \];#s",
+    $openapi,
+    $path
+)) {
+    $fails[] = 'the cancel path entry is not where this gate can see it';
+} elseif (false === strpos($path[1], '_conflictResponse(')) {
+    $fails[] = 'the cancel operation does not document its 409, so the spec'
+        . ' describes a route that always succeeds';
+}
+if (preg_match(
+    '#private static function _errorResponses\(\).*?\'409\'#s',
+    $openapi
+)) {
+    $fails[] = 'the 409 has leaked into the shared error map, so every'
+        . ' operation now claims a status only cancel and delete can return';
 }
 
 if ($fails) {

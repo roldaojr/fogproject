@@ -2,22 +2,305 @@ name: Tests
 
 # A pull_request trigger can only fire from the repository the PR is opened
 # against, so this stub has to live here even though every other fogproject
-# workflow lives in FOGProject/fog-workflows. It is deliberately six lines:
-# all of the logic is in the reusable workflow, so fixing the runner does not
-# mean editing this file on three branches.
+# workflow lives in FOGProject/fog-workflows. It is deliberately thin: all of
+# the logic is in the reusable workflows, so fixing the runner does not mean
+# editing this file on every branch. What stays here is POLICY -- which jobs
+# run, in what order, for which pull requests.
 #
 # For pull_request events GitHub reads workflows from the merge of head into
-# base, so one copy on each BASE branch (working-1.6, dev-branch, stable)
-# covers every PR opened against it -- the contributor's branch needs
-# nothing.
+# base, so one copy on each BASE branch covers every PR opened against it and
+# the contributor's branch needs nothing. working-1.6 and dev-branch carry a
+# copy; dev-branch's has the `suite` job only, and `stable` has no copy at all.
 #
 # Not a push trigger, and not because of caution: the runaway that put ~30
 # commits on dev-branch in 20 minutes happened because the triggered
-# workflow pushed a commit back here. This one only reads.
+# workflow pushed a commit back here.
+#
+# The `suite` job only reads. The `regen` job DOES push -- one commit, to the
+# pull request's head branch -- and that push raises `synchronize`, so this
+# file runs again. That is bounded rather than open-ended: both operations it
+# performs are idempotent, so the second run finds nothing to do and pushes
+# nothing. The full argument, and the two runtime circuit breakers that hold
+# even if that argument stops being true, are at the top of fog-workflows'
+# fogproject-pr-regen.yml. Read them before changing either job.
+#
+# WHY regen COMES FIRST AND suite IS THE ONE WITH `needs:`
+#
+# It used to be the other way round -- regen `needs: suite`, so a correction
+# was only ever made to a tree that had already gone green. The cost of that
+# ordering was a whole second test run per push: regen's commit raised
+# `synchronize`, and the resulting run repeated all seven suite jobs on a tree
+# that differed only by derived files. Measured on this repository's own runs
+# 2026-08-26/27, the suite is 418 of a run's 447 runner-seconds and regen is
+# the other 29 -- and it was not an edge case, because FOG_VERSION is a commit
+# count, so essentially EVERY push here drifts the version and earns a bot
+# commit.
+#
+# Inverted, one contributor push costs: regen (pushes) -> suite SKIPPED,
+# because that push has already started the run that matters -> second run,
+# regen finds nothing -> suite runs, once, against the tree that will actually
+# merge. The seven required contexts still land on the SHA the ruleset gates
+# on, because that SHA is the corrected one either way.
+#
+# What this gives up is the suite running on the PRE-correction tree, and that
+# is the point rather than a regression: the corrections are a PSR2 reformat of
+# this pull request's own files, a deterministic gettext regeneration, and a
+# version string. If one of those could turn a green tree red, the correction
+# is the bug and it should not be being made at all.
+#
+# The corollary is that regen now runs on pull requests whose tests FAIL. That
+# is deliberate and harmless -- nothing it does depends on the suite -- but it
+# is a real behaviour change, so it is written here rather than left to be
+# rediscovered.
 
+# WHY `merge_group` IS HERE
+#
+# working-1.6 is behind a merge queue. GitHub builds each queued entry on a
+# temporary `gh-readonly-queue/...` branch and raises a `merge_group` event
+# against it, and the ruleset's eight required contexts have to be reported ON
+# THAT BRANCH before the entry can merge. A workflow that triggers only on
+# `pull_request` never runs there, so nothing reports, and the entry sits until
+# the ruleset's check_response_timeout_minutes expires and it is ejected. The
+# symptom is not a red X: it is every pull request silently failing to merge an
+# hour after being queued.
+#
+# Both events, one file. A pull request still gets the full suite before it is
+# queued -- that is where a contributor sees a failure -- and the queue re-runs
+# it against the tree that will actually land, which is the whole point of a
+# queue.
+#
+# Only `regen` is pull-request-only, and it excludes itself: every term in its
+# `if` reads `github.event.pull_request`, which is null under `merge_group`. It
+# must stay that way. It pushes a commit to a head branch, and a queue entry has
+# no head branch to push to -- the queue branch is read-only and is deleted when
+# the entry finishes.
 on:
   pull_request:
+  merge_group:
 
 jobs:
+  # Regenerates the derived files -- PSR2 formatting and the gettext catalogue
+  # -- on this pull request, and pushes one commit to its head branch. All of
+  # the logic is in fog-workflows; what lives here is the POLICY of which pull
+  # requests are eligible, which is branch-local information and is already
+  # where sync-generated-files.yml keeps the identical allowlist.
+  #
+  # First in the graph, and with no `needs:` -- see WHY regen COMES FIRST at
+  # the top of this file.
+  #
+  # THE GUARDS HERE ARE NOT DECORATION
+  #
+  # Same-repo: `pull_request` withholds secrets from a fork, so there is no App
+  # token to mint, the App is not installed on the contributor's account
+  # anyway, and pushing to a fork head needs maintainer_can_modify, which is
+  # theirs to set. A merged fork PR is picked up by the daily sweep instead.
+  #
+  # Head denylist: workflows for a `pull_request` are read from the merge of
+  # head into base, so a PR whose HEAD is a long-lived branch runs this file
+  # too. stable-releases.yml opens exactly such a PR (`stable` -> `dev-branch`)
+  # to sync a release back. Without this list, the dev-branch base allowlist
+  # would have this job push commits onto `stable` -- a branch whose version
+  # is owned exclusively by stable-releases.yml.
+  #
+  # Base allowlist: dev-branch, the 1.6 patches line since the 1.6.0 release
+  # (it was working-1.6 before).
+  regen:
+    name: regenerate
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.base.ref == 'dev-branch'
+      && !contains(fromJson('["stable", "master", "dev-branch", "working-1.6"]'), github.event.pull_request.head.ref)
+
+    # Least privilege, stated rather than inherited -- the same reasoning as
+    # sync-generated-files.yml next door. Everything the called workflow writes
+    # uses a GitHub App token, so nothing on this path needs a writable
+    # GITHUB_TOKEN, and a called workflow can never hold more permission than
+    # its caller.
+    permissions:
+      contents: read
+
+    uses: FOGProject/fog-workflows/.github/workflows/fogproject-pr-regen.yml@main
+
+    # NO `with:` BLOCK, AND IN PARTICULAR NO `sync_version: true`.
+    #
+    # This job used to also predict the version the branch would carry after
+    # its merge commit landed, and commit that here. It worked -- for exactly
+    # one pull request at a time.
+    #
+    # FOG_VERSION is `git rev-list master..HEAD --count`, so the value is a
+    # property of the commit graph while the storage is a single tracked line
+    # of packages/web/src/Base/System.php. Predicting it on a branch means
+    # predicting "the count after MY merge", and only one open pull request can
+    # ever be next. Every other open branch is left holding a different value
+    # on the same line, so the moment anything merges, updating those branches
+    # -- which the ruleset requires before they can merge -- conflicts on
+    # System.php by construction and the prediction has to be redone.
+    #
+    # That is not a race that better ordering fixes. Observed here: #1504 took
+    # three version commits (4598 -> 4600 -> 4608) as its neighbors landed,
+    # and merge 3fbacbc73 carries the conflict in its own message. #1507 and
+    # #1508 sat open simultaneously holding 4620 and 4619.
+    #
+    # The version is written on the BASE branch after the merge instead, by
+    # sync-generated-files.yml next door -- one writer, nothing to conflict
+    # with. That file is no longer a backstop for the version; it is the
+    # mechanism. PSR2 formatting and the gettext catalogue stay here, because
+    # those are regenerated FROM the pull request's own files and so have no
+    # equivalent problem.
+    #
+    # Restoring this line also means restoring the ruleset dependency it
+    # carried: it is only computable while working-1.6 requires up-to-date
+    # branches AND merge commits as the only merge method.
+    secrets: inherit
+
   suite:
+    # Named because the job KEY is what GitHub puts in the middle of a called
+    # workflow's check name, so an unnamed `suite:` rendered every check as
+    # "Tests / suite / tests (PHP 7.4)". Every job in the reusable workflow is
+    # named already; this was the one link in the chain that was not.
+    #
+    # `fogproject` rather than something generic because fog-workflows hosts
+    # fog-plugins-tests.yml alongside fogproject-tests.yml, so which project's
+    # suite is running is the useful thing for this segment to say.
+    #
+    # THESE NAMES ARE NOW LOAD-BEARING. The ruleset "working-1.6 pull request
+    # gate" (active since 2026-08-26) requires all nine of `fogproject / tests
+    # (PHP 7.4)`, `fogproject / tests (PHP 8.3)`, `fogproject / vendor matches
+    # composer.lock`, `fogproject / schema on mariadb:10.5`, `fogproject /
+    # schema on mariadb:11.8`, `fogproject / schema on mysql:8.0`, `fogproject /
+    # release pins resolve`, `fogproject / upgrade rehearsal` and `fogproject /
+    # upgrade from stable` -- plus `phpstan`, which is an inline job below and
+    # so carries no prefix. `fogproject / upgrade from dev-branch` reports too
+    # and is advisory on purpose (see that job in fog-workflows).
+    # Renaming this job, or a job inside fogproject-tests.yml, silently orphans
+    # a required context and parks every pull request on "Expected -- waiting
+    # for status to be reported". Update the ruleset in the same change.
+    #
+    # `fogproject / upgrade rehearsal` joined on 2026-09-01. It had been
+    # reporting since 2026-08-31 and was simply never added -- the ruleset was
+    # last edited the day before the job landed -- so it was an omission rather
+    # than a decision, and it showed: #1604 merged with that check RED, because
+    # a required-context list is the only thing the merge queue consults. Its
+    # own docblock in fog-workflows argues the case ("a gate nobody can fail is
+    # the thing these jobs exist to stop"); it is now one that can be failed.
+    name: fogproject
+    needs: regen
+
+    # Two separate things, and the `!cancelled()` half is the one that stops
+    # this wedging the repository:
+    #
+    #   !cancelled() -- overrides the implicit `success()` that a `needs:`
+    #     otherwise imposes. Without it, a regen job that FAILED or was SKIPPED
+    #     (fork PR, wrong base, denylisted head) would take the suite with it,
+    #     none of the seven required contexts would ever appear, and the pull
+    #     request would be unmergeable. regen is not a required context and
+    #     must never become a hard gate; it is allowed to go red on its own.
+    #     A genuinely cancelled run -- superseded by a newer push -- correctly
+    #     skips the suite, since a fresh run is already on its way.
+    #
+    #     A MERGE QUEUE run is the same shape: regen excludes itself there
+    #     (no pull request context to match), and the suite has to run anyway
+    #     -- it is the only thing that reports the required contexts on the
+    #     queue branch. See WHY `merge_group` IS HERE at the top.
+    #
+    #   pushed != 'true' -- the saving. regen sets this output only when a
+    #     commit actually landed on the head branch, and that push has by then
+    #     raised `synchronize`, so a run against the corrected tree is already
+    #     queued. Testing this SHA would be testing a tree that no longer
+    #     exists. An empty value (regen skipped) reads as not-'true' and lets
+    #     the suite run, which is what fork and dev-branch pull requests need.
+    #
+    # The second half was described here for weeks and never written into the
+    # expression, so every push that earned a regen commit paid for a full
+    # suite twice: the suite started on the pre-correction tree, regen's push
+    # raised `synchronize` mid-run, and that superseded run was cancelled and
+    # repeated against the bot's commit. The comment measures the suite at 418
+    # of a run's 447 runner-seconds, so this was very nearly the whole cost of
+    # a run, discarded, on essentially every push.
+    if: ${{ !cancelled() && needs.regen.outputs.pushed != 'true' }}
+
     uses: FOGProject/fog-workflows/.github/workflows/fogproject-tests.yml@main
+
+  # Static analysis. Fails only on errors this pull request ADDS -- everything
+  # the tree reported when it was introduced is captured in
+  # phpstan-baseline.neon, so the count can only go down. See phpstan.neon for
+  # why the level, the phpVersion range and reportUnmatchedIgnoredErrors are
+  # what they are.
+  #
+  # NOT a called workflow, unlike its two siblings. fog-workflows is shared with
+  # fog-plugins, and this gate is fogproject-specific: the baseline, the paths
+  # and the constants stub are all properties of this tree. Keeping it local
+  # means adding it does not touch a workflow another repository consumes.
+  #
+  # Runs alongside `suite` rather than gating it -- same `needs`/`if` pair, for
+  # the same reason. It has to see the tree regen will actually leave behind,
+  # since regen runs php-cs-fixer over this pull request's own files.
+  #
+  # A REQUIRED CONTEXT since 2026-08-28, after four consecutive green pull
+  # requests (#1437, #1438, #1439, #1440). The ruleset "working-1.6 pull
+  # request gate" now requires nine checks: the eight `fogproject / ...` ones
+  # the `suite:` comment lists, and this one.
+  #
+  # THE CONTEXT IS `phpstan` -- exactly that, with no prefix. Verified against
+  # the check-runs API rather than guessed, because the two naming schemes on
+  # this workflow look inconsistent and are not: a CALLED workflow's check run
+  # is named `<caller job name> / <called job name>`, which is where
+  # `fogproject / tests (PHP 8.3)` comes from (the `suite:` job is named
+  # `fogproject`). An INLINE job's check run is just its own name. So this one
+  # is `phpstan` while its two siblings carry prefixes. Renaming this job to
+  # anything else -- or the ruleset to `Tests / phpstan` -- orphans the context
+  # and parks every pull request on "Expected -- waiting for status to be
+  # reported".
+  #
+  # Safe to require on fork pull requests, which is why it could be promoted
+  # and `regen` cannot: this job only checks out and reads, so nothing about it
+  # depends on write permissions a fork's token does not have. `regen` pushes,
+  # is skipped on forks, and must therefore stay optional forever.
+  #
+  # It stays a gate that can only be satisfied, never one that grows: the job
+  # fails only on errors a pull request ADDS, because everything the tree
+  # reported at introduction is in phpstan-baseline.neon. Requiring it is what
+  # stops that baseline quietly growing again.
+  phpstan:
+    name: phpstan
+    needs: regen
+    # Same pair as `suite:` above, including the pushed guard, and for the same
+    # reason -- see the note there. This job runs php-cs-fixer's output through
+    # static analysis, so testing a tree regen is about to replace is the same
+    # waste here as it is there.
+    if: ${{ !cancelled() && needs.regen.outputs.pushed != 'true' }}
+    runs-on: ubuntu-latest
+
+    # Read-only. This job never writes to the repository -- unlike regen, which
+    # is the only thing on this path that pushes.
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 8.3 is what RUNS the analyser; it is unrelated to the 7.4-8.3 range
+      # phpstan.neon analyses AGAINST. PHPStan reasons about the target version
+      # from configuration, not from the interpreter it happens to be under.
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      # The ROOT composer.json, not packages/web's. It holds phpstan as the only
+      # dev dependency, pinned exactly, and installs to a root vendor/ that is
+      # gitignored and never deployed.
+      - name: Install the pinned analyser
+        run: composer install --no-interaction --no-progress
+
+      # 2G because the 128M default crashes a parallel worker and reports it as
+      # "Child process error: PHPStan process crashed", which reads like a tool
+      # fault rather than a configuration one.
+      - name: Analyse
+        run: vendor/bin/phpstan analyse --memory-limit=2G --no-progress --error-format=github
+
+      # A second pass with its own config and its own baseline. Same job
+      # rather than its own, so the ruleset context stays the single name
+      # `phpstan` and neither pass can be required without the other.
+      - name: Analyse tests
+        run: vendor/bin/phpstan analyse -c phpstan-tests.neon --memory-limit=2G --no-progress --error-format=github

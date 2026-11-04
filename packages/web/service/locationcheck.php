@@ -11,6 +11,9 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+
 /**
  * Used for the location plugin and only checks if it is enabled
  * or not.
@@ -21,16 +24,17 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
-$count = FOGCore::getClass('PluginManager')
-    ->count(
-        array(
-            'installed' => 1,
-            'state' => 1,
-            'name' => 'location',
-        )
-    );
-if ($count > 0) {
+if (in_array('location', FOGCore::$pluginsinstalled)) {
     echo '##';
 }
 exit;

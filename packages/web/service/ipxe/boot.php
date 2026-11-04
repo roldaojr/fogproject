@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Boot\IpxeBootMenu;
+
 /**
  * Boot page for pxe/iPXE
  *
@@ -19,6 +23,15 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../../commons/base.inc.php';
 header("Content-type: text/plain");
 /*
@@ -37,7 +50,7 @@ header("Content-type: text/plain");
  * null from filter_input() and array_filter() drops them, so a one-NIC
  * machine posting only mac0 behaves exactly as before.
  */
-$macFields = array(
+$macFields = [
     'mac',
     'mac0',
     'macboot',
@@ -47,9 +60,9 @@ $macFields = array(
     'mac4',
     'mac5',
     'mac6',
-    'mac7'
-);
-$macLists = array();
+    'mac7',
+];
+$macLists = [];
 foreach ($macFields as $macField) {
     $macLists[] = explode('|', (string)filter_input(INPUT_POST, $macField));
 }
@@ -70,4 +83,4 @@ FOGCore::getHostItem(
     false,
     $mac
 );
-new BootMenu();
+new IpxeBootMenu();

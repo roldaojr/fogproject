@@ -1,0 +1,706 @@
+<?php
+/**
+ * The join credential goes to as few machines as possible, for as short a
+ * time as possible.
+ *
+ * Design 0009 section 6. Every check here is one way the credential could
+ * quietly go somewhere it should not, or one way a join could quietly do
+ * damage:
+ *
+ * - `Client\HostnameChanger::json()` puts `ADUser` and `ADPass` in the
+ *   answer to EVERY check-in of EVERY host with `useAD` set, joined or not.
+ *   `DirectoryJoin::desired()` must return null in every case where nothing
+ *   can be done with the credential, because null is what keeps it off the
+ *   machine.
+ * - The cooldown is not politeness. A join that fails on a bad password is a
+ *   failed authentication against somebody's domain controller, and without
+ *   the stamp it is one per host per poll -- which is how a service account
+ *   with a lockout policy gets locked out, taking every other host's join
+ *   with it.
+ * - A settled status clears the error, or the report shows a stale failure
+ *   against a machine that is now joined.
+ * - The stored-secret decoder's base64 test has to be STRICT. Non-strict
+ *   base64_decode does not fail on an ordinary password -- it drops the
+ *   characters outside the alphabet and decodes what is left -- so a lax
+ *   test hands back a string the admin never typed. That is a live bug in
+ *   the legacy client's copy of this dance.
+ *
+ * DB-free: the harness's fake connection stands in.
+ *
+ * Usage: php tests/agent-directory-join.test.php
+ * Exit status 0 = pass, 1 = fail.
+ */
+
+require __DIR__ . '/lib/fog-test-harness.php';
+
+FogTestHarness::boot('agent-directory-join');
+$db = FogTestHarness::fakeDb();
+
+$t = new FogChecks();
+
+/**
+ * Call a protected static on DirectoryJoin.
+ *
+ * @param string $name the method
+ * @param array  $args the arguments
+ *
+ * @return mixed
+ */
+function dj($name, array $args)
+{
+    $m = new \ReflectionMethod(\FOG\Agent\DirectoryJoin::class, $name);
+    $m->setAccessible(true);
+
+    return $m->invokeArgs(null, $args);
+}
+
+/**
+ * A host that needs no database to answer for itself.
+ *
+ * @param array $fields what to set on it
+ *
+ * @return \FOG\Items\Host
+ */
+function djHost(array $fields = [])
+{
+    $Host = new \FOG\Items\Host();
+    $Host->set('id', 7)->set('name', 'WS-014');
+    foreach ($fields as $k => $v) {
+        $Host->set($k, $v);
+    }
+
+    return $Host;
+}
+
+/**
+ * A membership row that needs no database.
+ *
+ * @param array $fields what to set on it
+ *
+ * @return \FOG\Items\HostDirectory
+ */
+function djObserved(array $fields = [])
+{
+    $Observed = new \FOG\Items\HostDirectory();
+    $Observed->set('id', 3)->set('hostID', 7);
+    foreach ($fields as $k => $v) {
+        $Observed->set($k, $v);
+    }
+
+    return $Observed;
+}
+
+// ------------------------------------------------- the columns are mapped
+
+$mapped = array_keys(
+    (function () {
+        $p = new \ReflectionProperty(
+            \FOG\Items\HostDirectory::class,
+            'databaseFields'
+        );
+        $p->setAccessible(true);
+        return (array)$p->getValue(new \FOG\Items\HostDirectory());
+    })()
+);
+foreach (['joinAt', 'joinError'] as $field) {
+    $t->check(
+        sprintf('HostDirectory maps %s', $field),
+        in_array($field, $mapped, true)
+    );
+}
+
+// --------------------------------------------------------------- the modes
+
+$t->check(
+    'every settled status is a real status',
+    [] === array_diff(
+        \FOG\Agent\DirectoryJoin::SETTLED_STATUSES,
+        \FOG\Agent\DirectoryJoin::STATUSES
+    )
+);
+$t->check(
+    'refused is a status of its own, not a kind of failure',
+    in_array('refused', \FOG\Agent\DirectoryJoin::STATUSES, true)
+        && !in_array('refused', \FOG\Agent\DirectoryJoin::SETTLED_STATUSES, true)
+);
+
+// ----------------------------------------------------- the capability gate
+
+$caps = new \ReflectionClassConstant(\FOG\Agent\State::class, 'CAPABILITIES');
+$t->check(
+    'the directory capability is gated on the EXISTING hostnamechanger '
+        . 'module, not a new switch an admin has to find',
+    'hostnamechanger' === ($caps->getValue()['directory'] ?? null)
+);
+
+$itemReports = new \ReflectionClassConstant(\FOG\Agent\State::class, 'ITEM_REPORTS');
+$t->check(
+    'the join result routes through the existing registry, not a new path',
+    \FOG\Agent\DirectoryJoin::class === ($itemReports->getValue()['directory'] ?? null)
+);
+
+// Why it has to be an ITEM report and not a plain one: the join's own
+// vocabulary does not fit in the outer `status` field, which carries the
+// capability's applied/unchanged/pending_reboot/failed. `joined` is not one
+// of those, and `failed` means two different things in the two places --
+// which is exactly why they need two fields.
+$resultStatuses = new \ReflectionClassConstant(\FOG\Agent\State::class, 'RESULT_STATUSES');
+foreach (['joined', 'already_joined', 'refused', 'unsupported'] as $own) {
+    $t->check(
+        sprintf('%s has nowhere to live in the capability status field', $own),
+        in_array($own, \FOG\Agent\DirectoryJoin::STATUSES, true)
+            && !in_array($own, $resultStatuses->getValue(), true)
+    );
+}
+
+// A host may only report on its own membership.
+$refused = false;
+try {
+    \FOG\Agent\DirectoryJoin::report(djHost(), 999, ['status' => 'joined']);
+} catch (\RuntimeException $e) {
+    $refused = 404 === $e->getCode();
+}
+$t->check(
+    'a host reporting on somebody else\'s membership is refused',
+    $refused
+);
+
+// -------------------------------------------------- when nothing is sent
+
+$t->check(
+    'a host not set to use AD is sent nothing',
+    null === \FOG\Agent\DirectoryJoin::desired(djHost(['useAD' => 0]))
+);
+$t->check(
+    'a host with no domain is sent nothing',
+    null === \FOG\Agent\DirectoryJoin::desired(
+        djHost(['useAD' => 1, 'ADDomain' => '  '])
+    )
+);
+
+// The rest go through blockFor(), which takes the membership row rather
+// than looking it up -- the rule about when a credential leaves this server
+// needs no database to state.
+/**
+ * blockFor() with a given membership row.
+ *
+ * @param \FOG\Items\Host               $Host     the host
+ * @param \FOG\Items\HostDirectory|null $Observed what it last reported
+ *
+ * @return array|null
+ */
+function djDesired($Host, $Observed)
+{
+    return \FOG\Agent\DirectoryJoin::blockFor($Host, $Observed);
+}
+
+$joinable = ['useAD' => 1, 'ADDomain' => 'corp.example.com',
+    'ADUser' => 'svc-join', 'ADPass' => 'letmein',
+    'ADOU' => 'OU=Workstations,DC=corp,DC=example,DC=com', 'enforce' => 1];
+
+$t->check(
+    'a host that has never reported its membership is sent nothing -- the '
+        . 'server does not know whether it is joined, and a credential is '
+        . 'not something to send on a guess',
+    null === djDesired(djHost($joinable), null)
+);
+$t->check(
+    'a host already joined is sent nothing, which is most of an estate most '
+        . 'of the time',
+    null === djDesired(
+        djHost($joinable),
+        djObserved(['joined' => 1, 'domain' => 'corp.example.com'])
+    )
+);
+$t->check(
+    'a host joined to a DIFFERENT domain is sent nothing either: the agent '
+        . 'would refuse, so sending the credential exposes it for nothing',
+    null === djDesired(
+        djHost($joinable),
+        djObserved(['joined' => 1, 'domain' => 'other.example.com'])
+    )
+);
+
+// ------------------------------------------------ a rename (design 0017)
+
+/**
+ * blockFor() for a host whose agent runs on Windows.
+ *
+ * @param \FOG\Items\Host               $Host     the host
+ * @param \FOG\Items\HostDirectory|null $Observed what it last reported
+ *
+ * @return array|null
+ */
+function djDesiredWindows($Host, $Observed)
+{
+    return \FOG\Agent\DirectoryJoin::blockFor($Host, $Observed, true);
+}
+
+$inDomainAs = function ($account) {
+    return djObserved(
+        ['joined' => 1, 'domain' => 'corp.example.com',
+            'netbios' => 'CORP', 'machineAccount' => $account]
+    );
+};
+
+$rename = djDesiredWindows(djHost($joinable), $inDomainAs('WS-OLD$'));
+$t->check(
+    'a joined Windows host whose account carries an old name IS sent a '
+        . 'block: it cannot rename its own object without the credential',
+    is_array($rename)
+);
+$t->check(
+    'the rename block names the host\'s new name',
+    'WS-014' === ($rename['rename_to'] ?? null)
+);
+$t->check(
+    'the rename block carries the credential the rename needs',
+    'letmein' === ($rename['password'] ?? null)
+        && 'corp.example.com\\svc-join' === ($rename['username'] ?? null)
+);
+$t->check(
+    'a joined host whose account already carries its name is sent nothing, '
+        . 'in any case',
+    null === djDesiredWindows(djHost($joinable), $inDomainAs('ws-014$'))
+);
+$t->check(
+    'a name past fifteen characters compares as its NetBIOS account, or '
+        . 'the credential would go out every hour forever',
+    null === djDesiredWindows(
+        djHost(array_merge($joinable, ['name' => 'WORKSTATION-0001-LAB'])),
+        $inDomainAs('WORKSTATION-000$')
+    )
+);
+$t->check(
+    'a joined host that did not report its account is sent nothing: no '
+        . 'credential on a guess',
+    null === djDesiredWindows(djHost($joinable), $inDomainAs(''))
+);
+$t->check(
+    'a host in ANOTHER domain is still sent nothing for a rename',
+    null === djDesiredWindows(
+        djHost($joinable),
+        djObserved(['joined' => 1, 'domain' => 'other.example.com',
+            'machineAccount' => 'WS-OLD$'])
+    )
+);
+$t->check(
+    'a joined Linux host is sent nothing: it cannot rename its object, so '
+        . 'the credential would go out every hour for nothing',
+    null === djDesired(djHost($joinable), $inDomainAs('WS-OLD$'))
+);
+$cooling = $inDomainAs('WS-OLD$');
+$cooling->set('joinAt', gmdate('Y-m-d H:i:s'));
+$t->check(
+    'a rename attempt starts the same cooldown a join does',
+    null === djDesiredWindows(djHost($joinable), $cooling)
+);
+$t->check(
+    'a join block carries no rename_to, so an agent that predates it reads '
+        . 'a join',
+    !array_key_exists(
+        'rename_to',
+        (array)djDesiredWindows(djHost($joinable), djObserved(['joined' => 0]))
+    )
+);
+// ------------------------------------- a rename held by the cooldown
+
+$t->check(
+    'a rename held by the cooldown says when it may go ahead',
+    1 === preg_match(
+        '/^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$/',
+        \FOG\Agent\DirectoryJoin::waitFor(djHost($joinable), $cooling, true)
+    )
+);
+$t->check(
+    'a rename that is not held says nothing: the block carries it instead',
+    '' === \FOG\Agent\DirectoryJoin::waitFor(
+        djHost($joinable),
+        $inDomainAs('WS-OLD$'),
+        true
+    )
+);
+$t->check(
+    'a joined host already carrying its name has nothing waiting, even in '
+        . 'the cooldown',
+    '' === \FOG\Agent\DirectoryJoin::waitFor(
+        djHost($joinable),
+        (function () use ($inDomainAs) {
+            $o = $inDomainAs('WS-014$');
+            $o->set('joinAt', gmdate('Y-m-d H:i:s'));
+            return $o;
+        })(),
+        true
+    )
+);
+$t->check(
+    'an unjoined host in the cooldown is a held JOIN, not a held rename',
+    '' === \FOG\Agent\DirectoryJoin::waitFor(
+        djHost($joinable),
+        djObserved(['joined' => 0, 'joinAt' => gmdate('Y-m-d H:i:s')]),
+        true
+    )
+);
+$t->check(
+    'a Linux host never waits on a rename it will never be sent',
+    '' === \FOG\Agent\DirectoryJoin::waitFor(djHost($joinable), $cooling, false)
+);
+$resultStatuses2 = new \ReflectionClassConstant(\FOG\Agent\State::class, 'RESULT_STATUSES');
+$t->check(
+    'pending is a result status the agent may report',
+    in_array('pending', $resultStatuses2->getValue(), true)
+);
+
+$t->check(
+    'renamed is a settled status: it clears a stale error',
+    in_array('renamed', \FOG\Agent\DirectoryJoin::SETTLED_STATUSES, true)
+);
+
+$block = djDesired(djHost($joinable), djObserved(['joined' => 0]));
+$t->check('an unjoined host IS sent a block', is_array($block));
+$t->check(
+    'the block carries the domain',
+    'corp.example.com' === ($block['domain'] ?? null)
+);
+$t->check(
+    'the block carries the OU, so the object is created where it belongs '
+        . 'instead of landing in CN=Computers and needing a move',
+    'OU=Workstations,DC=corp,DC=example,DC=com' === ($block['ou'] ?? null)
+);
+$t->check(
+    'the account is domain-qualified',
+    'corp.example.com\\svc-join' === ($block['username'] ?? null)
+);
+$t->check(
+    'the password is there to send',
+    'letmein' === ($block['password'] ?? null)
+);
+$t->check(
+    'the reboot permission is the host\'s existing enforce flag, not a new one',
+    true === ($block['reboot'] ?? null)
+);
+
+// An account an admin already qualified is left alone.
+$qualified = $joinable;
+$qualified['ADUser'] = 'CORP\\svc-join';
+$block2 = djDesired(djHost($qualified), djObserved(['joined' => 0]));
+$t->check(
+    'an already-qualified account is not qualified twice',
+    'CORP\\svc-join' === ($block2['username'] ?? null)
+);
+$upn = $joinable;
+$upn['ADUser'] = 'svc-join@corp.example.com';
+$block3 = djDesired(djHost($upn), djObserved(['joined' => 0]));
+$t->check(
+    'a userPrincipalName is left as typed',
+    'svc-join@corp.example.com' === ($block3['username'] ?? null)
+);
+
+// A host with no credential still gets a block, so the agent can report why.
+$nocred = $joinable;
+$nocred['ADUser'] = '';
+$block4 = djDesired(djHost($nocred), djObserved(['joined' => 0]));
+$t->check(
+    'a host with no credential still gets a block, so the agent reports '
+        . 'refused with a reason instead of looking identical to a joined host',
+    is_array($block4) && '' === ($block4['username'] ?? null)
+        && '' === ($block4['password'] ?? null)
+);
+
+// ------------------------------------------------------------ the cooldown
+
+$t->check(
+    'a host never attempted is not cooling',
+    false === dj('cooling', [djObserved([])])
+);
+$t->check(
+    'a zero datetime is not a recent attempt',
+    false === dj('cooling', [djObserved(['joinAt' => '0000-00-00 00:00:00'])])
+);
+$storeTz = (new \ReflectionMethod(\FOG\Base\FOGBase::class, 'storageTimeZone'));
+$storeTz->setAccessible(true);
+$tz = $storeTz->invoke(null);
+$recent = (new \DateTime('-1 minute'))->setTimezone($tz)->format('Y-m-d H:i:s');
+$t->check(
+    'an attempt a minute ago is cooling -- without this, a wrong password '
+        . 'is one failed authentication per host per poll, which is how a '
+        . 'service account with a lockout policy gets locked out',
+    true === dj('cooling', [djObserved(['joinAt' => $recent])])
+);
+$old = (new \DateTime('-2 hours'))->setTimezone($tz)->format('Y-m-d H:i:s');
+$t->check(
+    'an attempt two hours ago is not cooling, so a corrected password is '
+        . 'acted on without an admin restarting anything',
+    false === dj('cooling', [djObserved(['joinAt' => $old])])
+);
+$t->check(
+    'the default cooldown outlasts a poll interval by a wide margin',
+    \FOG\Agent\DirectoryJoin::RETRY_AFTER >= 1800
+);
+
+// ------------------------------------------ the admin sets the cooldown
+
+/**
+ * Seeds FOG_AGENT_JOIN_COOLDOWN so getSetting() answers without a query.
+ *
+ * @param string $value the stored setting
+ *
+ * @return void
+ */
+function djCooldown($value)
+{
+    FogTestHarness::setStatic(
+        'FOGBase',
+        '_settingsCache',
+        ['FOG_AGENT_JOIN_COOLDOWN' => ['value' => $value, 'ts' => time()]]
+    );
+    FogTestHarness::setStatic('FOGBase', '_settingsFileChecked', true);
+}
+
+foreach ([
+    ['3600', 3600, 'the shipped value'],
+    ['900', 900, 'a shorter wait an admin chose'],
+    ['', 3600, 'an empty setting falls back to the default'],
+    ['abc', 3600, 'a value that is not a number falls back to the default'],
+    ['0', 60, 'zero is held to the floor: no cooldown is one failed sign-in '
+        . 'per host per poll'],
+    ['999999', 86400, 'a huge value is held to one day'],
+] as [$value, $want, $why]) {
+    djCooldown($value);
+    $t->check(
+        sprintf('cooldown "%s" is %d seconds: %s', $value, $want, $why),
+        $want === \FOG\Agent\DirectoryJoin::retryAfter()
+    );
+}
+$twenty = (new \DateTime('-20 minutes'))->setTimezone($tz)->format('Y-m-d H:i:s');
+djCooldown('900');
+$t->check(
+    'an attempt 20 minutes ago is past a 15 minute cooldown',
+    false === dj('cooling', [djObserved(['joinAt' => $twenty])])
+);
+djCooldown('3600');
+$t->check(
+    'the same attempt is still cooling under the hour default',
+    true === dj('cooling', [djObserved(['joinAt' => $twenty])])
+);
+
+// --------------------------------- a deploy forgets the last attempt
+
+$stamped = djObserved(['joined' => 0, 'joinAt' => $recent]);
+$t->check(
+    'a deploy clears a stamp that is still cooling',
+    true === dj('forget', [$stamped])
+        && '' === (string)$stamped->get('joinAt')
+        && false === dj('cooling', [$stamped])
+);
+$t->check(
+    'with the stamp gone, the fresh image is sent the join on its next poll',
+    is_array(djDesired(djHost($joinable), $stamped))
+);
+$t->check(
+    'a host with no membership row has nothing to forget',
+    false === dj('forget', [null])
+);
+$t->check(
+    'a stamp past its cooldown is left as it is, so the report keeps it',
+    false === dj('forget', [djObserved(['joinAt' => $old])])
+);
+
+$cooling = djDesired(
+    djHost($joinable),
+    djObserved(['joined' => 0, 'joinAt' => $recent])
+);
+$t->check('a cooling host is sent nothing', null === $cooling);
+
+// -------------------------------------------------------- the error rule
+
+$t->check(
+    'a failure keeps its message',
+    'adcli: Insufficient access'
+        === dj('errorFor', ['failed', 'adcli: Insufficient access'])
+);
+$t->check(
+    'a refusal keeps its message',
+    'already joined to other.example.com'
+        === dj('errorFor', ['refused', 'already joined to other.example.com'])
+);
+$t->check(
+    'unsupported keeps its message',
+    'neither adcli nor realm is installed'
+        === dj('errorFor', ['unsupported', 'neither adcli nor realm is installed'])
+);
+foreach (\FOG\Agent\DirectoryJoin::SETTLED_STATUSES as $settled) {
+    $t->check(
+        sprintf(
+            '%s CLEARS a stale error -- an admin chasing a message against '
+                . 'a machine that is now joined is worse off than one '
+                . 'chasing none',
+            $settled
+        ),
+        '' === dj('errorFor', [$settled, 'adcli: Insufficient access'])
+    );
+}
+$t->check(
+    'a provider novel is cut to what the column holds',
+    \FOG\Agent\DirectoryJoin::MAX_ERROR
+        === strlen(dj('errorFor', ['failed', str_repeat('x', 4000)]))
+);
+
+// ------------------------------------------- the stored-secret decoder
+
+$t->check(
+    'an empty stored secret decodes to empty',
+    '' === \FOG\Agent\DirectoryPlacement::decodeStored('   ')
+);
+$t->check(
+    'a plain password comes back as itself',
+    'S3cret!pass' === \FOG\Agent\DirectoryPlacement::decodeStored('S3cret!pass')
+);
+$t->check(
+    'a base64-stored password is decoded',
+    'S3cret!pass'
+        === \FOG\Agent\DirectoryPlacement::decodeStored(base64_encode('S3cret!pass'))
+);
+// The strictness check. Non-strict base64_decode() skips characters outside
+// the alphabet and decodes what is left, so an ordinary password that
+// happens to contain some base64 characters comes back as garbage -- which
+// is the live bug in Client\HostnameChanger's copy of this dance.
+$awkward = 'Passw0rd!!';
+$t->check(
+    'a password that merely looks base64-ish is NOT decoded',
+    $awkward === \FOG\Agent\DirectoryPlacement::decodeStored($awkward)
+);
+
+// ------------------------------------------------ the report is honest
+
+$rp = new \ReflectionMethod(\FOG\Reports\Directory_Membership::class, 'join');
+$rp->setAccessible(true);
+$t->check(
+    'a join error is what the report shows',
+    'adcli: Insufficient access'
+        === $rp->invoke(null, ['hdJoinError' => 'adcli: Insufficient access'])
+);
+$t->check(
+    'a host never attempted shows nothing rather than ok',
+    '' === $rp->invoke(null, ['hdJoinAt' => '', 'hdJoinError' => ''])
+);
+$t->check(
+    'an attempt with no error shows ok',
+    'ok' === $rp->invoke(
+        null,
+        ['hdJoinAt' => '2026-09-04 21:00:00', 'hdJoinError' => '']
+    )
+);
+
+$src = file_get_contents(
+    dirname(__DIR__) . '/packages/web/src/Reports/Directory_Membership.php'
+);
+foreach (['hdJoinAt', 'hdJoinError'] as $column) {
+    $t->check(
+        sprintf('the report actually selects %s', $column),
+        false !== strpos($src, '`' . $column . '`')
+    );
+}
+
+// -------------------------------------- nothing logs the credential
+
+$src = file_get_contents(
+    dirname(__DIR__) . '/packages/web/src/Agent/DirectoryJoin.php'
+);
+$t->check(
+    'the audit line never formats the password',
+    false === strpos($src, "get('ADPass')")
+        || 1 === preg_match_all("/get\('ADPass'\)/", $src)
+);
+
+// ------------------------------- DIRECTORY_JOIN_ACCOUNT (GH-1887)
+
+/**
+ * Starts a clean hook manager, with an optional DIRECTORY_JOIN_ACCOUNT
+ * listener that answers for one domain.
+ *
+ * @param string|null $domain the domain the listener answers for, or null
+ *                            for no listener
+ * @param array       $seen   every domain the event was fired for
+ *
+ * @return void
+ */
+function djAccountFor($domain, &$seen)
+{
+    $seen = [];
+    $hooks = new \FOG\Base\HookManager();
+    if (null !== $domain) {
+        $hooks->register(
+            'DIRECTORY_JOIN_ACCOUNT',
+            function (&$args) use ($domain, &$seen) {
+                $seen[] = $args['domain'];
+                if ($domain === $args['domain']) {
+                    $args['user'] = 'svc-domainjoin';
+                    $args['password'] = 'domain-secret';
+                }
+            }
+        );
+    }
+    FogTestHarness::setStatic('FOGBase', 'HookManager', $hooks);
+}
+
+/**
+ * The legacy client's hostnamechanger answer for a host.
+ *
+ * @param \FOG\Items\Host $Host the host
+ *
+ * @return array
+ */
+function djLegacy($Host)
+{
+    FogTestHarness::setStatic('FOGBase', 'Host', $Host);
+    $hc = (new \ReflectionClass(\FOG\Client\HostnameChanger::class))
+        ->newInstanceWithoutConstructor();
+
+    return $hc->json();
+}
+
+$fresh = djObserved(['joined' => 0]);
+
+djAccountFor('corp.example.com', $seen);
+$block = djDesired(djHost($joinable), $fresh);
+$t->check(
+    'the agent is sent the account a listener supplies for the domain,'
+        . ' qualified with the domain like the host\'s own',
+    is_array($block)
+        && 'corp.example.com\\svc-domainjoin' === $block['username']
+        && 'domain-secret' === $block['password']
+);
+$t->check('the listener is told the host\'s domain', ['corp.example.com'] === $seen);
+$legacy = djLegacy(djHost($joinable));
+$t->check(
+    'the legacy client is sent the same account, in its own keys',
+    'corp.example.com\\svc-domainjoin' === $legacy['ADUser']
+        && 'domain-secret' === $legacy['ADPass']
+);
+
+djAccountFor('other.example.com', $seen);
+$block = djDesired(djHost($joinable), $fresh);
+$t->check(
+    'a listener with no account for the domain leaves the host\'s own',
+    is_array($block)
+        && 'corp.example.com\\svc-join' === $block['username']
+        && 'letmein' === $block['password']
+);
+
+djAccountFor(null, $seen);
+$legacy = djLegacy(djHost($joinable));
+$t->check(
+    'with no listener, the legacy client is sent the host\'s own account',
+    'corp.example.com\\svc-join' === $legacy['ADUser'] && 'letmein' === $legacy['ADPass']
+);
+
+djAccountFor('corp.example.com', $seen);
+djLegacy(djHost(['useAD' => 0] + $joinable));
+\FOG\Agent\DirectoryJoin::account(djHost(['ADDomain' => ''] + $joinable), 'u', 'p');
+$t->check(
+    'a host that does not join, or has no domain, never asks for an account',
+    [] === $seen
+);
+
+$t->finish();

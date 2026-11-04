@@ -31,9 +31,35 @@ pot="$langdir/messages.pot"
 # strings: without them every regeneration rewrites the POT-Creation-Date and
 # every source line number, so the file differs on every run even when no
 # translatable string changed.
+# The plugin tree is fetched, not committed (ADR 0009), and the find below is a
+# filesystem walk -- so regenerating from a clone that has not run
+# bin/fetch-plugins.sh quietly produces a catalogue with every plugin string
+# missing. Measured on the first commit that hit it: 528 msgids gone, the whole
+# of LDAP, Windows Key and WOL Broadcast among them, and the only symptom was a
+# large diff in a file nobody reads closely.
+#
+# Refusing is right rather than fetching here: this script is deliberately
+# side-effect free -- it stages nothing, commits nothing and touches no network
+# -- and a translation regeneration is not the place to start downloading
+# releases. The caller knows whether it can fetch.
+plugindir="$project_dir/packages/web/lib/plugins"
+if [ ! -d "$plugindir" ] || [ -z "$(ls -A "$plugindir" 2>/dev/null)" ]; then
+    echo "update-language.sh: $plugindir is empty or missing." >&2
+    echo "Regenerating now would drop every plugin string from the catalogue." >&2
+    echo "Run bin/fetch-plugins.sh first." >&2
+    exit 1
+fi
+
+# vendor/ is excluded, not merely uninteresting. Third-party packages are full
+# of English prose in exceptions and docblocks; xgettext cannot tell that from
+# a FOG string, so without this every one of them lands in messages.pot and
+# then in all nine .po files, and a translator is asked to translate Composer's
+# error messages. It also makes the catalogue change whenever a dependency is
+# bumped, which is churn in a file nobody reads closely -- the same failure the
+# --no-wrap note below exists to prevent.
 xgettext --language=PHP --from-code=UTF-8 --output="$pot" \
     --omit-header --no-location \
-    $(find "$project_dir/packages/web/" -name "*.php")
+    $(find "$project_dir/packages/web/" -name "*.php" -not -path "*/vendor/*")
 
 # Sorting makes the file order-independent, so two machines that walked the
 # source tree in a different order still produce the same POT.

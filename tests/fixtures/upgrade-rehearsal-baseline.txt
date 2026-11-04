@@ -1,0 +1,12 @@
+  constraints declared and applicable here: 98
+  constraints actually present:             96
+  MISSING:                                  2
+    fk_hostMAC_hmHostID                      CASCADE     orphan rows: 0
+    fk_nfsGroupMembers_ngmGroupID            RESTRICT    orphan rows: 1
+  integrity no foreign key can express:
+    hosts with no MAC                        3
+    images in no storage group               1
+    MACs claimed by more than one host       1
+    hosts with more than one primary MAC     1
+    zero dates in hosts.hostLastDeploy       0
+  (both refusals above are seed-induced and by design -- see the comment on this block)

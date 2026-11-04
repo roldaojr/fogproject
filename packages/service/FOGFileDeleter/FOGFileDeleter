@@ -1,0 +1,27 @@
+#!/usr/bin/php -q
+<?php
+/**
+ * FOGFileDeleter service to delete files from FOG on schedule
+ *
+ * PHP version 5
+ *
+ * @category FOGFileDeleter
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+
+/**
+ * FOGFileDeleter service to delete files from FOG on schedule
+ *
+ * @category FOGScheduler
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+require dirname(realpath(__FILE__)).'/../etc/config.php';
+require dirname(realpath(__FILE__)).'/../lib/service_lib.php';
+service_persist('FOGFileDeleter');
+\FOG\Base\FOGCore::getClass('FileDeleter')->run();

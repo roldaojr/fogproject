@@ -19,7 +19,7 @@
  * third-party callers are unaffected.
  *
  * This gate pins the property that makes the split worth having. It is
- * static on purpose: the behaviour needs a database, a populated
+ * static on purpose: the behavior needs a database, a populated
  * FOG_PXE_ADVANCED and FOG_ADVANCED_MENU_LOGIN toggled on to observe, and a
  * test that needs all three is a test nobody runs.
  *
@@ -82,22 +82,10 @@ function methodTokens($file, $method)
     return null;
 }
 
-$userFile = 'packages/web/lib/fog/user.class.php';
+$userFile = 'packages/web/src/Items/User.php';
 
 // 1. Both halves of the split must exist.
-/*
- * dev-branch carries authenticate() and validatePw() but NOT the
- * establishSession() extraction: validatePw() there still contains the
- * LDAP-era branch that signs a user in when passwordValidate() failed,
- * and splitting that faithfully would mean blessing it. authenticate()
- * mirrors its acceptance without the session, which is the property this
- * gate exists to hold; the extraction is working-1.6's to keep.
- */
-$required = ['authenticate', 'validatePw'];
-if (null !== methodTokens($userFile, 'establishSession')) {
-    $required[] = 'establishSession';
-}
-foreach ($required as $m) {
+foreach (['authenticate', 'establishSession', 'validatePw'] as $m) {
     if (null === methodTokens($userFile, $m)) {
         $fails[] = "User::$m() is missing -- the authenticate/establishSession"
             . " split has been undone";
@@ -135,7 +123,7 @@ if (null !== $body) {
  */
 $browserless = array_merge(
     glob('packages/web/service/ipxe/*.php') ?: [],
-    ['packages/web/lib/fog/bootmenu.class.php']
+    ['packages/web/src/Boot/IpxeBootMenu.php']
 );
 foreach ($browserless as $file) {
     if (!is_readable($file)) {

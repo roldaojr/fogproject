@@ -25,71 +25,26 @@
  * host was invisible to TaskManager, which is the half that turns a display
  * bug into an operational one.
  *
- * This is a STRUCTURAL test and needs no database: the defect is in the SQL
- * text, so the SQL text is what it reads. The behavioural proof, which drives
- * real rows through a real schema, is a separate file and skips where there
- * is no database to drive -- meaning this is the arm that actually gates CI.
+ * This branch fixed it in 1cd7446f6 and shipped no test with the fix, which
+ * is what this file is. It is STRUCTURAL and needs no database: the defect is
+ * in the SQL text, so the SQL text is what it reads -- and so it runs in CI,
+ * where there is no server to drive rows through. dev-branch, which got the
+ * same fix later, carries this file plus a behavioral counterpart that does
+ * drive real rows.
  *
  * Usage: php tests/relationship-filter-in-join.test.php
  * Exit status 0 = pass, 1 = fail.
  */
 
-require __DIR__ . '/lib/scope-harness.php';
+use FOG\Base\FOGCore;
+use FOG\Items\Host;
 
-// This branch has no shared FogTestHarness; scopeHarnessBoot() is the
-// equivalent, and it already installs a fake database, so nothing here
-// touches a real one.
-scopeHarnessBoot(dirname(__DIR__) . '/packages/web');
+require __DIR__ . '/lib/fog-test-harness.php';
 
-$t = new RelFilterChecks();
+FogTestHarness::boot('relfilter');
+FogTestHarness::fakeDb();
 
-/**
- * The assertion helper every test on this branch hand-rolls.
- */
-class RelFilterChecks
-{
-    /** @var array */
-    public $failures = array();
-
-    /** @var int */
-    public $count = 0;
-
-    /**
-     * @param string $label what is being asserted
-     * @param bool   $cond  the assertion
-     *
-     * @return bool the assertion, so a caller can branch on it
-     */
-    public function check($label, $cond)
-    {
-        $this->count++;
-        if (!$cond) {
-            $this->failures[] = $label;
-        }
-        return (bool)$cond;
-    }
-
-    /**
-     * Print the verdict and exit with the suite's convention.
-     *
-     * @return void
-     */
-    public function finish()
-    {
-        if (count($this->failures)) {
-            fwrite(
-                STDERR,
-                'FAIL (' . count($this->failures) . ' of ' . $this->count . "):\n"
-            );
-            foreach ($this->failures as $f) {
-                fwrite(STDERR, "  - $f\n");
-            }
-            exit(1);
-        }
-        echo 'ok  ' . $this->count . " checks passed\n";
-        exit(0);
-    }
-}
+$t = new FogChecks();
 
 /**
  * Builds one class's join text and its WHERE additions.
@@ -101,8 +56,8 @@ class RelFilterChecks
 function relFilterBuild($class)
 {
     $obj = FOGCore::getClass($class);
-    $join = array();
-    $where = array();
+    $join = [];
+    $where = [];
     $c = null;
     return $obj->buildQuery($join, $where, $c);
 }
@@ -113,14 +68,12 @@ function relFilterBuild($class)
  *    and the test would be measuring nothing.
  */
 $relProp = new \ReflectionProperty(
-    get_class(FOGCore::getClass('Host')),
+    get_class(new Host()),
     'databaseFieldClassRelationships'
 );
 $relProp->setAccessible(true);
-$rels = $relProp->getValue(FOGCore::getClass('Host'));
-$macRel = isset($rels['MACAddressAssociation'])
-    ? $rels['MACAddressAssociation']
-    : null;
+$rels = $relProp->getValue(new Host());
+$macRel = $rels['MACAddressAssociation'] ?? null;
 $t->check(
     'Host still declares a filtered relationship to MACAddressAssociation',
     is_array($macRel) && isset($macRel[3]) && is_array($macRel[3])
@@ -132,7 +85,7 @@ $t->check(
  *    still an outer one. Both halves matter: moving the predicate to ON while
  *    turning the join inner would drop exactly the same rows.
  */
-list($joins, $where) = relFilterBuild('Host');
+[$joins, $where] = relFilterBuild('Host');
 $t->check(
     'the hostMAC join is still a LEFT OUTER JOIN',
     false !== strpos($joins, 'LEFT OUTER JOIN `hostMAC` ON ')
@@ -151,23 +104,62 @@ $t->check(
  *    rather than derived so that a class LOSING its path to Host shows up as
  *    a skipped name here, not as silence.
  */
-$classes = array(
+$classes = [
     'Host',
     'Task',
     'SnapinJob',
     'SnapinTask',
-    'ImagingLog',
+    // ImagingLog was here until ADR 0022 decision 3 retired the table, and
+    // nothing replaces it. TaskLog is the class that took over recording an
+    // imaging run, but it declares NO relationship to Host at all -- it
+    // reaches a host through the id it stores, not through a join -- so it
+    // does not belong on this list. That is deliberate rather than an
+    // oversight: giving TaskLog a Host relationship would pull Host's
+    // filtered hostMAC join, and the `primary => 1` predicate with it, into
+    // every taskLog query. That is the exact defect this file exists to
+    // catch, so the fix for it must not create a new instance of it.
     'NodeFailure',
     'UserTracking',
-    'LocationAssociation',
-    'SiteHostAssociation',
-);
+    'OUAssociation',
+];
+
+/*
+ * OUAssociation is the one name here that a plugin owns
+ * (lib/plugins/ou/src/Items/OUAssociation.php), and plugins are FETCHED by
+ * bin/fetch-plugins.sh rather than tracked -- so lib/plugins does not exist
+ * at all in a fresh clone, a fresh worktree, or on a CI runner. Failing on it
+ * there says "a class lost its path to Host" when the truth is "nobody ran
+ * fetch-plugins", which is not a regression and not actionable.
+ *
+ * A missing CORE class still fails, which is the assertion this list was
+ * written for. Only the plugin-provided ones are excused, and only when the
+ * plugin tree is genuinely absent -- if the tree IS there and the class is
+ * not, that is a real regression and still fails.
+ *
+ * This is why every fogproject pull request reported 79/2 rather than 80/1
+ * once fog-workflows GH-27 turned pipefail on: the suite had been failing in
+ * CI from the day it was added, and `run-all.sh | tee` was discarding the
+ * status. See GH-1241 for the same swallow in the schema job.
+ */
+$pluginOwned = ['OUAssociation'];
+$pluginsFetched = is_dir(dirname(__DIR__) . '/packages/web/lib/plugins');
 foreach ($classes as $class) {
-    if (!class_exists($class)) {
+    // Resolved through qualify(), which is exactly what relFilterBuild()'s
+    // getClass() call does below -- so the existence check and the thing it
+    // guards cannot disagree about which class a short name means. Core is
+    // namespaced under src/ and no longer aliased into the global namespace
+    // (ADR 0013 §2); the short names are kept here because they are also the
+    // labels in every message this loop writes.
+    if (!class_exists(\FOG\Base\FOGBase::qualify($class))) {
+        if (in_array($class, $pluginOwned, true) && !$pluginsFetched) {
+            echo "  SKIP  $class is plugin-provided and lib/plugins is not"
+                . " fetched here\n";
+            continue;
+        }
         $t->check("$class exists, so its join is actually being checked", false);
         continue;
     }
-    list($j, $w) = relFilterBuild($class);
+    [$j, $w] = relFilterBuild($class);
     $t->check(
         "$class puts no hostMAC predicate in WHERE",
         !preg_grep('/hostMAC|hmPrimary/', (array)$w)

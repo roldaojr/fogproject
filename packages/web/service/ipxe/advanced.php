@@ -10,6 +10,9 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+
 /**
  * This presents the advanced menu
  *
@@ -19,6 +22,15 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../../commons/base.inc.php';
 header('Content-type: text/plain');
 /**
@@ -29,9 +41,8 @@ header('Content-type: text/plain');
  * @return void
  */
 $parseMe = function ($Send) {
-    foreach ($Send as $ipxe => &$val) {
+    foreach ($Send as $ipxe => $val) {
         printf("%s\n", implode("\n", (array)$val));
-        unset($val);
     }
 };
 /**
@@ -47,8 +58,8 @@ $parseMe = function ($Send) {
  */
 $promptForLogin = function () use ($parseMe) {
     $parseMe(
-        array(
-            'loginstuff' => array(
+        [
+            'loginstuff' => [
                 '#!ipxe',
                 'clear username',
                 'clear password',
@@ -57,8 +68,8 @@ $promptForLogin = function () use ($parseMe) {
                 'param username ${username}',
                 'param password ${password}',
                 'chain ${boot-url}/service/ipxe/advanced.php##params',
-            )
-        )
+            ]
+        ]
     );
     exit;
 };
@@ -70,8 +81,9 @@ if ($login) {
 }
 /**
  * FOG_ADVANCED_MENU_LOGIN is what the admin sets to mean "the advanced
- * menu requires a login". It defaults to 0, so the menu is open unless it
- * was deliberately turned on, and that default is preserved here.
+ * menu requires a login". It defaults to 0 (schema.php:1871), so the menu
+ * is open unless it was deliberately turned on, and that default is
+ * preserved here.
  *
  * It was, however, never enforced by the file that actually serves the
  * menu: the printf below sat outside every conditional, so FOG_PXE_ADVANCED
@@ -90,16 +102,16 @@ if (FOGCore::getSetting('FOG_ADVANCED_MENU_LOGIN')) {
     // no request will ever present back. isValid() is the real test.
     if (!FOGCore::authenticateOnly($user, $pass)->isValid()) {
         $parseMe(
-            array(
-                'loginfail' => array(
+            [
+                'loginfail' => [
                     '#!ipxe',
                     'clear username',
                     'clear password',
                     'echo Invalid login!',
                     'sleep 3',
                     'chain -ar ${boot-url}/service/ipxe/advanced.php',
-                )
-            )
+                ]
+            ]
         );
         exit;
     }

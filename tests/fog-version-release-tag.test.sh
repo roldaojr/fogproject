@@ -65,6 +65,13 @@ commit '2020-01-03T00:00:00Z' 'patch'
 git -C "$fx" checkout -q -b feature-x master
 commit '2020-02-01T00:00:00Z' 'feature work'
 git -C "$fx" tag -a archive/feature-x -m 'archive'
+
+# A release-candidate tag of the NEXT line. It starts with a digit, so the
+# '[0-9]*' filter alone lets it through, and the dev arm then reported 1.6.<count>
+# on the 1.5 line. A pre-release tag carries a '-'; a release tag never does.
+git -C "$fx" checkout -q -b rc-1.6.0 master
+commit '2020-03-01T00:00:00Z' 'rc'
+git -C "$fx" tag 1.6.0-RC-1
 git -C "$fx" checkout -q dev-branch
 
 count=$(git -C "$fx" rev-list master..dev-branch --count)
@@ -72,7 +79,76 @@ want="1.5.10.$count"
 
 for arm in dev-branch stable; do
     got=$(cd "$fx" && sh .githooks/lib/fog-version.sh "$arm" head 2>/dev/null | sed -n '1p')
-    [ "$got" = "$want" ] || bad "$arm computed '$got', expected '$want'. A non-release tag newer than the last release must not become the base version."
+    # stable reports the release tag itself (the fixture's 1.5.10.1, above);
+    # dev-branch counts from its base.
+    w="$want"
+    if [ "$arm" = stable ]; then
+        w="1.5.10.1"
+    fi
+    [ "$got" = "$w" ] || bad "$arm computed '$got', expected '$w'. A non-release or pre-release tag newer than the last release must not become the base version."
 done
+
+# A checkout whose HEAD reaches no release tag, while one exists elsewhere --
+# what CI tests: the pull request's merge ref, with the dev arm run against it.
+# That must still compute, from the newest release tag in the repository.
+fcount=$(git -C "$fx" rev-list master..feature-x --count)
+got=$(cd "$fx" && git checkout -q feature-x && sh .githooks/lib/fog-version.sh dev-branch head 2>/dev/null | sed -n '1p')
+git -C "$fx" checkout -q dev-branch
+[ "$got" = "1.5.10.$fcount" ] || bad "dev arm on a HEAD that reaches no release tag computed '$got', expected '1.5.10.$fcount'."
+
+# A three-part release tag -- 1.6.0, the first release of a line. The 1.5 tags
+# carry the build count as a fourth field (1.5.10.2518), so stripping the last
+# field gives the base. Stripping it from 1.6.0 gave 1.6 and the dev arm
+# reported 1.6.<count>. The installer reads any X.Y.Z version as a pinned FOS
+# release tag (downloadfiles() in lib/common/functions.sh), so 1.6.2 asked
+# FOGProject/fos for a release that does not exist.
+git -C "$fx" checkout -q -b line16 master
+commit '2020-04-01T00:00:00Z' 'release 1.6.0'
+git -C "$fx" tag -a 1.6.0 -m '1.6.0'
+commit '2020-04-02T00:00:00Z' 'patch'
+lcount=$(git -C "$fx" rev-list master..line16 --count)
+for arm in dev-branch stable; do
+    got=$(cd "$fx" && sh .githooks/lib/fog-version.sh "$arm" head 2>/dev/null | sed -n '1p')
+    if [ "$arm" = stable ]; then
+        # The stable arm reports the release it sits on: 1.6.0 is build 0.
+        want16="1.6.0.0"
+    else
+        want16="1.6.0.$lcount"
+    fi
+    [ "$got" = "$want16" ] || bad "$arm after a three-part release tag computed '$got', expected '$want16'."
+done
+git -C "$fx" checkout -q dev-branch
+
+# A plain clone of stable, the way bootstrap.sh and a 1.5 server's own
+# checkout get one: no local dev-branch. The stable arm used to count
+# master..dev-branch, which failed there, so no version.php was written and
+# every fresh 1.6.0 install reported the bare fallback 1.6.0.
+clone="$tmp/stableclone"
+# Its origin is unreachable, so the script cannot fetch a local master
+# either -- an offline server. Neither ref may be needed for stable.
+git clone -q --branch line16 "$fx" "$clone" 2>/dev/null &&
+    git -C "$clone" remote set-url origin "$tmp/unreachable" ||
+    bad "could not build the plain stable clone fixture."
+got=$(cd "$clone" && sh "$script" stable head 2>/dev/null | sed -n '1p')
+[ "$got" = "1.6.0.0" ] || bad "stable arm in a clone with no local dev-branch computed '$got', expected '1.6.0.0'."
+
+# A checkout with NO tags -- CI clones without them. The arms that do not use a
+# release tag must still compute. Looking the tag up at the top of the script
+# made this exit 129 before any arm ran.
+bare="$tmp/notags"
+git init -q -b master "$bare"
+git -C "$bare" config user.email t@example.invalid
+git -C "$bare" config user.name t
+git -C "$bare" config commit.gpgsign false
+mkdir -p "$bare/.githooks/lib" "$bare/packages/web/src/Base" "$bare/packages/web/lib/fog"
+cp "$script" "$bare/.githooks/lib/fog-version.sh"
+for f in packages/web/src/Base/System.php packages/web/lib/fog/system.class.php; do
+    printf "<?php\ndefine('FOG_VERSION', '1.6.0-beta');\n" > "$bare/$f"
+done
+git -C "$bare" add -A
+GIT_COMMITTER_DATE='2020-01-01T00:00:00Z' GIT_AUTHOR_DATE='2020-01-01T00:00:00Z' \
+    git -C "$bare" commit -q -m seed
+(cd "$bare" && sh .githooks/lib/fog-version.sh working-1.6 head >/dev/null 2>&1) \
+    || bad "working-1.6 arm failed in a checkout with no tags."
 
 exit $rc

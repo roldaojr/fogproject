@@ -1,16 +1,28 @@
 <?php
 /**
- * Renders one BootMenu scenario and prints the resulting iPXE script.
+ * Renders one boot-menu scenario and prints the resulting boot config.
  *
  * Run as a child process by bootmenu-ipxe-output.test.php. It is a separate
- * process because several BootMenu paths end in exit() -- noMenu() and the
- * tasking path among them -- which a single-process test runner could not
- * survive.
+ * process because several IpxeBootMenu paths end in exit() -- noMenu() and the
+ * tasking path among them -- which a single-process runner could not survive,
+ * and because IpxeBootMenu caches the architecture profile in a static
+ * (self::$_archProfile) that a second scenario in the same process would
+ * inherit.
  *
- * Usage: php bootmenu-render.php <scenario-json> <path-to-bootmenu.class.php>
+ * Usage: php bootmenu-render.php <scenario-json> <path-to-menu-class.php>
  */
 
 require_once __DIR__ . '/bootmenu-harness.php';
+// Publishes the harness's flat FOG\ stubs -- FOGBase, Route, StorageNode,
+// PXEMenuOptions -- under the bucket names both this file's `use` lines and
+// IpxeBootMenu's own imports expect since Move 2. Must run before the first
+// use of a bucketed name, not just before the class under test is required.
+require_once __DIR__ . '/stub-buckets.php';
+
+use FOG\Base\FOGBase;
+use FOG\Router\Route;
+use FOG\StubHookManager;
+use FOG\StubHost;
 
 $scenario = json_decode($argv[1] ?? '{}', true);
 $classFile = $argv[2] ?? '';
@@ -25,35 +37,39 @@ if (!is_file($classFile)) {
 }
 
 /*
- * BASEPATH decides whether _enrollSecureBootChoice() finds a MOK.der and
- * therefore which of its two branches renders. Point it at a scenario-owned
- * temp directory so both branches are reachable without touching a real
- * install.
+ * BASEPATH decides which Secure Boot branches render: MOK.der gates the
+ * attended enroll inside _enrollSecureBootChoice(), and PK/KEK/db.auth gate
+ * whether _filterMenus() shows the unattended one at all. Point it at a
+ * scenario-owned temp directory so every combination is reachable without
+ * touching a real install.
  */
 $base = sys_get_temp_dir() . '/bootmenu-test-' . getmypid() . '/';
 @mkdir($base . 'service/secureboot', 0777, true);
+$sbFiles = [];
 if (!empty($scenario['mok'])) {
-    file_put_contents($base . 'service/secureboot/MOK.der', 'test');
+    $sbFiles[] = 'MOK.der';
+}
+if (!empty($scenario['authvars'])) {
+    $sbFiles = array_merge($sbFiles, ['PK.auth', 'KEK.auth', 'db.auth']);
+}
+foreach ($sbFiles as $f) {
+    file_put_contents($base . 'service/secureboot/' . $f, 'test');
 }
 if (!defined('BASEPATH')) {
     define('BASEPATH', $base);
 }
 
 /*
- * Several BootMenu paths end in exit(), so the only reliable place to clean
+ * Several IpxeBootMenu paths end in exit(), so the only reliable place to clean
  * up the scenario's temp tree is a shutdown handler.
  */
 register_shutdown_function(
     function () use ($base) {
-        foreach (array('service/secureboot/MOK.der') as $file) {
-            if (is_file($base . $file)) {
-                unlink($base . $file);
-            }
+        foreach (glob($base . 'service/secureboot/*') ?: [] as $file) {
+            @unlink($file);
         }
-        foreach (array('service/secureboot', 'service', '') as $dir) {
-            if (is_dir($base . $dir)) {
-                @rmdir($base . $dir);
-            }
+        foreach (['service/secureboot', 'service', ''] as $dir) {
+            @rmdir($base . $dir);
         }
     }
 );
@@ -63,9 +79,13 @@ register_shutdown_function(
  * file reflects what a stock install actually emits.
  */
 FOGBase::$settings = array_merge(
-    array(
+    [
         'FOG_ADVANCED_MENU_LOGIN' => '0',
         'FOG_BOOT_EXIT_TYPE' => 'sanboot',
+        'FOG_CAPTUREIGNOREPAGEHIBER' => '0',
+        'FOG_CAPTURERESIZEPCT' => '5',
+        'FOG_CHANGE_HOSTNAME_EARLY' => '0',
+        'FOG_DISABLE_CHKDSK' => '1',
         'FOG_EFI_BOOT_EXIT_TYPE' => 'refind_efi',
         'FOG_IMAGE_LIST_MENU' => '0',
         'FOG_IPXE_BG_FILE' => 'bg.png',
@@ -85,7 +105,15 @@ FOGBase::$settings = array_merge(
         'FOG_KEYMAP' => '',
         'FOG_KEY_SEQUENCE' => '',
         'FOG_MEMTEST_KERNEL' => 'mt86plus_x86_64',
+        'FOG_MULTICAST_RENDEZVOUS' => '',
+        // Read only by falseTasking(), which destructures positionally;
+        // stock value from commons/schema.php.
+        'FOG_NONREG_DEVICE' => '',
+        'FOG_PIGZ_COMP' => '6',
         'FOG_NO_MENU' => '0',
+        // #198: ships in log mode; every scenario sends no SMBIOS values,
+        // so the decision returns early and the MAC stays the identity.
+        'FOG_HOST_IDENTIFY_SMBIOS' => 'log',
         'FOG_PXE_ADVANCED' => '0',
         'FOG_PXE_BOOT_IMAGE' => 'init.xz',
         'FOG_PXE_BOOT_IMAGE_32' => 'init_32.xz',
@@ -94,19 +122,25 @@ FOGBase::$settings = array_merge(
         'FOG_PXE_MENU_HIDDEN' => '0',
         'FOG_PXE_MENU_TIMEOUT' => '3',
         'FOG_REGISTRATION_ENABLED' => '1',
+        'FOG_TFTP_HOST' => '10.0.0.1',
         'FOG_TFTP_PXE_KERNEL' => 'bzImage',
         'FOG_TFTP_PXE_KERNEL_32' => 'bzImage32',
         'FOG_TFTP_PXE_KERNEL_ARM' => 'arm_Image',
         'FOG_WEB_HOST' => '10.0.0.1',
+        'FOG_WIPE_TIMEOUT' => '10',
         'FOG_WEB_ROOT' => '/fog/',
-    ),
-    (array)($scenario['settings'] ?? array())
+    ],
+    (array)($scenario['settings'] ?? [])
 );
 
 /**
  * The stock pxeMenu rows, per commons/schema.php. pxeParams is only set on
- * the rows schema.php gives one to, because _menuOpt() branches on whether
- * a row has params at all.
+ * the rows schema.php gives one to, because _menuOpt() branches on whether a
+ * row has params at all.
+ *
+ * @param string $extra the distinguishing param line
+ *
+ * @return string
  */
 $loginParams = function ($extra) {
     return "login\nparams\nparam mac0 \${net0/mac}\nparam arch \${arch}\n"
@@ -115,36 +149,39 @@ $loginParams = function ($extra) {
         . "isset \${net1/mac} && param mac1 \${net1/mac} || goto bootme\n"
         . "isset \${net2/mac} && param mac2 \${net2/mac} || goto bootme";
 };
-$rows = array(
-    array(1, 'fog.local', 'Boot from hard disk', '1', '2', null, ''),
-    array(2, 'fog.memtest', 'Run Memtest86+', '0', '2', null, ''),
-    array(3, 'fog.reginput', 'Perform Full Host Registration and Inventory',
-        '0', '0', 'mode=manreg', ''),
-    array(4, 'fog.keyreg', 'Update Product Key', '0', '1', null,
-        $loginParams('keyreg 1')),
-    array(5, 'fog.reg', 'Quick Registration and Inventory', '0', '0',
-        'mode=autoreg', ''),
-    array(6, 'fog.deployimage', 'Deploy Image', '0', '1', null,
-        $loginParams('qihost 1')),
-    array(7, 'fog.multijoin', 'Join Multicast Session', '0', '2', null,
-        $loginParams('sessionJoin 1')),
-    array(8, 'fog.quickdel', 'Quick Host Deletion', '0', '1', null,
-        $loginParams('delhost 1')),
-    array(9, 'fog.sysinfo', 'Client System Information (Compatibility)',
-        '0', '2', 'mode=sysinfo', ''),
-    array(10, 'fog.debug', 'Debug Mode', '0', '3', 'mode=onlydebug', ''),
-    array(11, 'fog.advanced', 'Advanced Menu', '0', '4', null, ''),
-    array(12, 'fog.advancedlogin', 'Advanced Menu', '0', '5', null,
-        $loginParams('advLog 1')),
-    array(13, 'fog.approvehost', 'Approve This Host', '0', '6', null,
-        $loginParams('approveHost 1')),
-    array(14, 'fog.enrollsecureboot', 'Enroll Secure Boot Key', '0', '2',
-        null, ''),
-);
-FOGBase::$menus = array_map(
-    function ($r) {
-        return new StubModel(
-            array(
+$rows = [
+    [1, 'fog.local', 'Boot from hard disk', '1', '2', null, ''],
+    [2, 'fog.memtest', 'Run Memtest86+', '0', '2', null, ''],
+    [3, 'fog.reginput', 'Perform Full Host Registration and Inventory',
+        '0', '0', 'mode=manreg', ''],
+    [4, 'fog.keyreg', 'Update Product Key', '0', '1', null,
+        $loginParams('keyreg 1')],
+    [5, 'fog.reg', 'Quick Registration and Inventory', '0', '0',
+        'mode=autoreg', ''],
+    [6, 'fog.deployimage', 'Deploy Image', '0', '1', null,
+        $loginParams('qihost 1')],
+    [7, 'fog.multijoin', 'Join Multicast Session', '0', '1', null,
+        $loginParams('sessionJoin 1')],
+    [8, 'fog.quickdel', 'Quick Host Deletion', '0', '1', null,
+        $loginParams('delhost 1')],
+    [9, 'fog.sysinfo', 'Client System Information (Compatibility)',
+        '0', '2', 'mode=sysinfo', ''],
+    [10, 'fog.debug', 'Debug Mode', '0', '3', 'mode=onlydebug', ''],
+    [11, 'fog.advanced', 'Advanced Menu', '0', '4', null, ''],
+    [12, 'fog.advancedlogin', 'Advanced Menu', '0', '5', null,
+        $loginParams('advLog 1')],
+    [13, 'fog.approvehost', 'Approve This Host', '0', '6', null,
+        $loginParams('approveHost 1')],
+    [14, 'fog.enrollsecureboot', 'Enroll Secure Boot Key', '0', '2', null, ''],
+    [15, 'fog.enrollsecurebootunattended',
+        'Enroll Secure Boot Key (Unattended - secure boot in setup mode '
+        . 'required)', '0', '2', 'mode=enrollsb', ''],
+];
+
+Route::$rows = [
+    'pxemenuoptions' => array_map(
+        function ($r) {
+            return (object)[
                 'id' => $r[0],
                 'name' => $r[1],
                 'description' => $r[2],
@@ -154,43 +191,143 @@ FOGBase::$menus = array_map(
                 'params' => $r[6],
                 'hotkey' => '0',
                 'keysequence' => '',
-            )
-        );
-    },
-    $rows
-);
-
-FOGBase::$storagenodes = array(
-    new StubStorageNode(
-        array(
+            ];
+        },
+        $rows
+    ),
+    'storagenode' => [
+        (object)[
             'id' => 1,
             'name' => 'DefaultMember',
             'ip' => '10.0.0.1',
             'path' => '/images/',
             'isEnabled' => 1,
             'isMaster' => 1,
-        )
-    ),
-);
+        ],
+    ],
+    'image' => [
+        (object)[
+            'id' => 1, 'name' => 'Win11', 'path' => 'win11', 'isEnabled' => 1,
+        ],
+        (object)[
+            'id' => 2, 'name' => 'Ubuntu', 'path' => 'ubuntu', 'isEnabled' => 1,
+        ],
+    ],
+    'host' => [],
+    'inventory' => [],
+    'ipxe' => [],
+    'multicastsessionassociation' => [],
+];
 
-FOGBase::$images = array(
-    new StubModel(
-        array('id' => 1, 'name' => 'Win11', 'path' => 'win11', 'isEnabled' => 1)
-    ),
-    new StubModel(
-        array('id' => 2, 'name' => 'Ubuntu', 'path' => 'ubuntu', 'isEnabled' => 1)
-    ),
-);
+/*
+ * The inventory row Route::getList('inventory', ...) returns. Its columns go
+ * through the same generateIpxeItems() as the host's, and the two records
+ * share names -- the inventory list joins the host name in as `hostname` --
+ * so a scenario needs to be able to plant one to exercise that overlap.
+ */
+if (!empty($scenario['inventoryRow'])) {
+    Route::$rows['inventory'][] = (object)array_merge(
+        ['id' => 1, 'hostID' => $scenario['host']['id'] ?? 1],
+        (array)$scenario['inventoryRow']
+    );
+}
 
-FOGBase::$Host = new StubHost((array)($scenario['host'] ?? array()));
+/*
+ * An install with no enabled storage node at all. Rare but reachable -- a
+ * half-finished install, or every node disabled -- and it used to decide
+ * whether the constructor emitted its header, '#!ipxe' included.
+ */
+if (!empty($scenario['noStorageNode'])) {
+    Route::$rows['storagenode'] = [];
+}
+
+/*
+ * The host row Route::getItem('host', id) returns, which generateIpxeItems()
+ * turns into `set ...` lines. Scenario-supplied extra columns land here too,
+ * so a scenario can plant a secret field and assert it never reaches iPXE.
+ */
+$hostData = (array)($scenario['host'] ?? []);
+if (!empty($hostData['id'])) {
+    $row = ['id' => $hostData['id'], 'name' => $hostData['name'] ?? 'testhost'];
+    foreach ((array)($scenario['hostRow'] ?? []) as $k => $v) {
+        $row[$k] = $v;
+    }
+    Route::$rows['host'][] = (object)$row;
+}
+
+FOGBase::$Host = new StubHost($hostData);
 FOGBase::$HookManager = new StubHookManager(
-    (array)(isset($scenario['hookMutations']) ? $scenario['hookMutations'] : array())
+    (array)($scenario['hookMutations'] ?? [])
 );
 
-$_REQUEST = (array)($scenario['request'] ?? array());
+$_REQUEST = (array)($scenario['request'] ?? []);
 $_GET = $_REQUEST;
 
+/*
+ * What getHostItem() resolved out of the request's mac0/macboot/mac1..mac7
+ * fields. Set here rather than derived from 'request' because that is what
+ * the real boot.php does -- it merges those fields itself and never writes a
+ * 'mac' one back -- and because filter_input() has no request to read under
+ * the CLI SAPI.
+ */
+FOGBase::$requestMacs = (array)($scenario['requestMacs'] ?? []);
+
+/*
+ * There is no autoloader here -- the harness requires the class file by path
+ * -- so the abstract half of the menu has to be loaded first. Sourced from
+ * the same directory as the class under test rather than hardcoded, so a
+ * renderer living anywhere else still finds it.
+ */
+$baseFile = dirname($classFile) . '/BootMenuBase.php';
+if (is_file($baseFile)) {
+    require_once $baseFile;
+}
+/*
+ * Same reasoning: UbootBootMenu's image-ignored path throws this rather than
+ * calling exit(), so renderForHost() can be used from a process that renders
+ * more than one host (UbootTftpSync). Only UbootBootMenu depends on it.
+ */
+/*
+ * Both menus call it for the fogpin= argument. Under the harness's http
+ * it returns '' without opening a connection.
+ */
+$pinFile = dirname($classFile) . '/FosTlsPin.php';
+if (is_file($pinFile)) {
+    require_once $pinFile;
+}
+$haltFile = dirname($classFile) . '/UbootRenderHalted.php';
+if (is_file($haltFile)) {
+    require_once $haltFile;
+}
+/*
+ * The real Secure Boot vocabulary, not a stub. It is pure, and the enrollment
+ * path compares the fingerprint of the scenario's MOK.der with it.
+ */
+$sbStateFile = dirname($classFile) . '/SecureBootState.php';
+if (is_file($sbStateFile)) {
+    require_once $sbStateFile;
+}
 require_once $classFile;
+
+/*
+ * Print any host write after the script. Only the Secure Boot enrollment
+ * path writes, so no other scenario's bytes change. A shutdown handler,
+ * because several paths end in exit().
+ */
+register_shutdown_function(
+    function () {
+        if (\FOG\HostManager::$updates) {
+            echo '#harness-writes ', json_encode(\FOG\HostManager::$updates), "\n";
+        }
+    }
+);
+
+/*
+ * Derived from the filename rather than hardcoded, so the same harness renders
+ * either bootloader. PSR-4 already requires the basename to match the declared
+ * class exactly (bin/psr4-scan.php --check enforces it), so this cannot drift.
+ */
+$menuClass = '\\FOG\\Boot\\' . basename($classFile, '.php');
 
 if (!empty($scenario['hooks'])) {
     /*
@@ -199,10 +336,32 @@ if (!empty($scenario['hooks'])) {
      * and report the payloads instead.
      */
     ob_start();
-    new BootMenu();
+    new $menuClass();
     ob_end_clean();
     echo json_encode(FOGBase::$HookManager->fired, JSON_PRETTY_PRINT), "\n";
     exit(0);
 }
 
-new BootMenu();
+// The second argument is UbootBootMenu's TFTP-path mode; IpxeBootMenu
+// declares no such parameter and PHP ignores the surplus argument.
+/*
+ * False-tasking mode. falseTasking() is not reachable from the constructor
+ * without a valid login -- the menu item that leads to it posts credentials
+ * and authenticateOnly() is stubbed to refuse -- so a scenario names it
+ * directly. It is worth reaching: it is the ONLY path that boots FOS with no
+ * task row behind it, and the reason it had never been rendered here is the
+ * reason GH-1767 survived in it.
+ *
+ * The constructor's own render stays in the golden ahead of it. In the real
+ * request the constructor flushes the '#!ipxe' header and then dispatches,
+ * so the leading menu here is scaffolding rather than what the wire carries;
+ * the subject of these two scenarios is the `kernel ... mac=` line at the end.
+ */
+$menu = new $menuClass(true, !empty($scenario['tftp']));
+$falseTasking = (array)($scenario['falseTasking'] ?? []);
+if ($falseTasking) {
+    // Built through StubTask rather than `new Image` directly: Image is
+    // declared in the harness, so only a call site INSIDE the harness
+    // resolves to the stub -- from here the name reaches the real model.
+    $menu->falseTasking('', (new \FOG\StubTask(['image' => $falseTasking]))->getImage());
+}

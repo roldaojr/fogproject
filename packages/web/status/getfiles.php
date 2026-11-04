@@ -10,6 +10,11 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Router\Route;
+use FOG\Util\FOGLogPaths;
+
 /**
  * Get's files stored as requested
  *
@@ -57,25 +62,12 @@ $decodePath = urldecode(
         $path
     )
 );
-Route::ids('storagenode', [], 'path');
-$imagePaths = json_decode(Route::getData(), true);
-Route::ids('storagenode', [], 'snapinpath');
-$snapinPaths = json_decode(Route::getData(), true);
-// Keep in step with StorageNode::_getData() and logtoview.php; see the note
-// there. '/var/log/fog/fos' is the FOS report log's own subdirectory.
-$validPaths = [
-    '/var/log/apache2',
-    '/var/log/fog',
-    '/var/log/fog/fos',
-    // FOGBase::logFault()'s. 1.6 keeps this list in one place
-    // (FOGLogPaths); on this branch it is spelled out in three, so a new
-    // log directory has to be added to all three or it is enumerated but
-    // not readable, or neither.
-    '/var/log/fog/faults',
-    '/var/log/httpd',
-    '/var/log/nginx',
-    '/var/log/php*'
-];
+$imagePaths = Route::getIds('storagenode', [], 'path');
+$snapinPaths = Route::getIds('storagenode', [], 'snapinpath');
+// The same list StorageNode::_getData() asks with. It has to be, or a path it
+// requests is dropped here with no error -- which is why it is no longer a
+// second copy.
+$validPaths = FOGLogPaths::directories();
 $validPaths = array_merge(
     $imagePaths,
     $snapinPaths,
@@ -95,6 +87,21 @@ foreach ((array)$paths as $decodedPath) {
         );
     }
 }
+/*
+ * One entry per DIRECTORY, not per node that names it.
+ *
+ * $validPaths is built from Route::getIds('storagenode', [], 'path') and the
+ * same for 'snapinpath', which return one row per storage node -- and every
+ * node in a group is normally configured with the same paths. So a request
+ * for /opt/fog/snapins matched four identical entries on a four-node
+ * install, globbed the same directory four times, and answered with every
+ * file repeated four times. A 200 with wrong data, scaling with node count,
+ * and invisible on the single-node installs most testing happens on.
+ *
+ * Deduplicated here rather than in $validPaths so it also covers two
+ * different allowed paths that glob to the same directory.
+ */
+$realpaths = array_unique((array)$realpaths);
 $files = [];
 foreach ($realpaths as $path) {
     if (!(is_dir($path)

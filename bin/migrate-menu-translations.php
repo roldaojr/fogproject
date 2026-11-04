@@ -66,14 +66,19 @@ $langDir = $root . '/packages/web/management/languages';
 // msgids _buildSubMenuItems() fed to sprintf -- ucfirst() of the node name --
 // so composing with them reproduces the old label exactly.
 $nodes = [
-    'Group'        => ['Group',        'List All Groups',         'Create New Group'],
-    'Host'         => ['Host',         'List All Hosts',          'Create New Host'],
-    'Image'        => ['Image',        'List All Images',         'Create New Image'],
-    'Printer'      => ['Printer',      'List All Printers',       'Create New Printer'],
-    'Snapin'       => ['Snapin',       'List All Snapins',        'Create New Snapin'],
-    'StorageGroup' => ['StorageGroup', 'List All Storage Groups', 'Create New Storage Group'],
-    'StorageNode'  => ['StorageNode',  'List All Storage Nodes',  'Create New Storage Node'],
-    'User'         => ['User',         'List All Users',          'Create New User'],
+    'group'        => ['Group',        'List All Groups',         'Create New Group'],
+    'host'         => ['Host',         'List All Hosts',          'Create New Host'],
+    'image'        => ['Image',        'List All Images',         'Create New Image'],
+    'ipxe'         => ['Ipxe',         'List All Ipxe Menus',     'Create New Ipxe Menu'],
+    'module'       => ['Module',       'List All Modules',        'Create New Module'],
+    'printer'      => ['Printer',      'List All Printers',       'Create New Printer'],
+    'role'         => ['Role',         'List All Roles',          'Create New Role'],
+    'site'         => ['Site',         'List All Sites',          'Create New Site'],
+    'snapin'       => ['Snapin',       'List All Snapins',        'Create New Snapin'],
+    'storagegroup' => ['Storagegroup', 'List All Storage Groups', 'Create New Storage Group'],
+    'storagenode'  => ['Storagenode',  'List All Storage Nodes',  'Create New Storage Node'],
+    'user'         => ['User',         'List All Users',          'Create New User'],
+    'usergroup'    => ['Usergroup',    'List All User Groups',    'Create New User Group'],
 ];
 
 /**
@@ -353,8 +358,16 @@ $hand['fr_FR'] = [
     'Create New Host'          => 'Créer une nouvelle machine',
     'List All Images'          => 'Lister toutes les images',
     'Create New Image'         => 'Créer une nouvelle image',
+    'List All Ipxe Menus'      => 'Lister tous les menus iPXE',
+    'Create New Ipxe Menu'     => 'Créer un nouveau menu iPXE',
+    'List All Modules'         => 'Lister tous les modules',
+    'Create New Module'        => 'Créer un nouveau module',
     'List All Printers'        => 'Lister toutes les imprimantes',
     'Create New Printer'       => 'Créer une nouvelle imprimante',
+    'List All Roles'           => 'Lister tous les rôles',
+    'Create New Role'          => 'Créer un nouveau rôle',
+    'List All Sites'           => 'Lister tous les sites',
+    'Create New Site'          => 'Créer un nouveau site',
     'List All Snapins'         => 'Lister tous les snapins',
     'Create New Snapin'        => 'Créer un nouveau snapin',
     'List All Storage Groups'  => 'Lister tous les groupes de stockage',
@@ -363,26 +376,41 @@ $hand['fr_FR'] = [
     'Create New Storage Node'  => 'Créer un nouveau nœud de stockage',
     'List All Users'           => 'Lister tous les utilisateurs',
     'Create New User'          => 'Créer un nouvel utilisateur',
+    'List All User Groups'     => "Lister tous les groupes d'utilisateurs",
+    'Create New User Group'    => "Créer un nouveau groupe d'utilisateurs",
     // Not menu labels, but the same catalog damage and the same one-line fix.
     // `Site` read "minutes" and `Role` read "Nom du module" -- which is how
     // "Lister tous les minutess" was being generated at runtime while this
     // was still composed. Corrected here because the composed form is what
     // made them invisible; they are wrong wherever else they are used too.
+    'Site'                     => 'Site',
+    'Role'                     => 'Rôle',
+    'Module'                   => 'Module',
 ];
 
-// Correct Spanish. Unlike working-1.6 this branch's bare nouns are all sound,
-// so only the composed labels need writing out. `imagen` and `impresora` are
-// feminine (todas las / nueva); the rest are masculine. `equipo` rather than
-// `anfitrion` because that is the word this catalog already uses for Host.
+// Correct Spanish, for the same reason and with the same damage: every single
+// "Create New X" in this catalog reads "Crear nuevo grupo" -- Create New
+// *Group* -- because a fuzzy match against `Create New %s` was accepted
+// wholesale. A Spanish user on the host page is told they are creating a
+// group. `imagen` and `impresora` are feminine (todas las / nueva); the rest
+// are masculine.
 $hand['es_ES'] = [
     'List All Groups'          => 'Listar todos los grupos',
     'Create New Group'         => 'Crear nuevo grupo',
-    'List All Hosts'           => 'Listar todos los equipos',
-    'Create New Host'          => 'Crear nuevo equipo',
+    'List All Hosts'           => 'Listar todos los anfitriones',
+    'Create New Host'          => 'Crear nuevo anfitrión',
     'List All Images'          => 'Listar todas las imágenes',
     'Create New Image'         => 'Crear nueva imagen',
+    'List All Ipxe Menus'      => 'Listar todos los menús iPXE',
+    'Create New Ipxe Menu'     => 'Crear nuevo menú iPXE',
+    'List All Modules'         => 'Listar todos los módulos',
+    'Create New Module'        => 'Crear nuevo módulo',
     'List All Printers'        => 'Listar todas las impresoras',
     'Create New Printer'       => 'Crear nueva impresora',
+    'List All Roles'           => 'Listar todos los roles',
+    'Create New Role'          => 'Crear nuevo rol',
+    'List All Sites'           => 'Listar todos los sitios',
+    'Create New Site'          => 'Crear nuevo sitio',
     'List All Snapins'         => 'Listar todos los snapins',
     'Create New Snapin'        => 'Crear nuevo snapin',
     'List All Storage Groups'  => 'Listar todos los grupos de almacenamiento',
@@ -391,6 +419,17 @@ $hand['es_ES'] = [
     'Create New Storage Node'  => 'Crear nuevo nodo de almacenamiento',
     'List All Users'           => 'Listar todos los usuarios',
     'Create New User'          => 'Crear nuevo usuario',
+    'List All User Groups'     => 'Listar todos los grupos de usuarios',
+    'Create New User Group'    => 'Crear nuevo grupo de usuarios',
+    // Same class of damage in the bare nouns, which the composed labels were
+    // reading from: `Site` said "minutos", `Role` and `Module` both said
+    // "Nombre del módulo", `iPXE Menu` held a whole sentence about gpxe.
+    'Site'                     => 'Sitio',
+    'Role'                     => 'Rol',
+    'Module'                   => 'Módulo',
+    'Printer'                  => 'Impresora',
+    'iPXE Menu'                => 'Menú iPXE',
+    'User Group'               => 'Grupo de usuarios',
 ];
 
 
@@ -515,9 +554,11 @@ foreach ($locales as $po) {
     // Confirmed means a live, non-empty, non-fuzzy msgstr that does not carry
     // a stray %s -- a person wrote it and reviewed it. Everything above is
     // reconstruction, and reconstruction does not get to overrule that, not
-    // even the hand-written tables: fr_FR already holds "Creer un nouveau
-    // Snapin" for `Create New Snapin`, and the only thing the French table
-    // would change about it is the capital S.
+    // even the hand-written tables. On this branch only ja_JP's `Create New
+    // Printer` and `Create New Snapin` qualify, and neither is in a hand
+    // table, so this changes nothing here; it is the same rule dev-branch
+    // needs, where five catalogs hold confirmed entries and the French table
+    // would otherwise have rewritten one of them.
     foreach (array_keys($added) as $msgid) {
         $cur = (string)($tr[$msgid] ?? '');
         if ('' === $cur || isset($fz[$msgid]) || false !== strpos($cur, '%s')) {

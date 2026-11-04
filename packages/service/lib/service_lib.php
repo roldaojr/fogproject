@@ -10,6 +10,11 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Db\DatabaseManager;
+use FOG\Db\PDODB;
+
 /**
  * Service library
  *
@@ -48,7 +53,7 @@ ini_set('log_errors', '1');
 // hung request surfaces an error to somebody; a hung daemon is invisible. A
 // read deadline in the shared DB layer would bind every present and future
 // caller to solve a problem only the daemons have. This file is required by
-// all seven daemons and by nothing else.
+// all eight daemons and by nothing else.
 //
 // The value is hard-coded because the timeout exists in order to bound
 // reading the database -- it cannot itself be read from a globalSetting. 300s
@@ -56,6 +61,13 @@ ini_set('log_errors', '1');
 // PDO raises 'MySQL server has gone away', which the supervisor logs and
 // recovers from by re-forking (#917).
 ini_set('mysqlnd.net_read_timeout', '300');
+/*
+ * A machine entry point: a daemon runs with no signed-in user and cannot
+ * acquire one. Declared here rather than in each daemon because this file
+ * is what every one of them requires -- see Authorization::_hasNoPrincipal()
+ * for what it licenses and why the distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
 require WEBROOT.'/commons/base.inc.php';
 $service_logpath = sprintf(
     '/%s/%s',
@@ -63,7 +75,7 @@ $service_logpath = sprintf(
     FOGCore::getSetting('SERVICEMASTERLOGFILENAME')
 );
 if (!is_file($service_logpath)) {
-    $service_logpath = '/opt/fog/log/servicemaster.log';
+    $service_logpath = FOG_LOG_DIR . DS . 'servicemaster.log';
 }
 $service_sleep_time = (int)FOGCore::getSetting('SERVICESLEEPTIME');
 if (!$service_sleep_time) {
@@ -93,6 +105,13 @@ register_shutdown_function('Service_Fatal_handler');
  */
 function Service_Log_message($logpath, $name, $msg)
 {
+    // The supervisor closes its connection before every fork (#1930), but
+    // formatting the time below can still read a setting -- the log gate
+    // behind it, once the cache entry is past its TTL. On a closed link that
+    // read failed and spilled warnings into this log (GH-1994). Reopen it;
+    // a no-op when connected, and Service_persist() closes it again before
+    // the next fork, so no child inherits it.
+    DatabaseManager::getLink();
     $msg = sprintf(
         "[%s] %s %s\n",
         FOGCore::formatTime('now', 'm-d-y g:i:s a'),
@@ -224,6 +243,15 @@ function Service_persist($service_name)
     Service_Log_message($service_logpath, $service_name, 'Start');
     Service_Register_Signal_handler();
     for (;;) {
+        // #1930: a forked child inherits the supervisor's MySQL socket, and
+        // so does every replacement forked after it. A child that dies in the
+        // middle of a result leaves unread packets on that socket; the next
+        // child then reads them as replies to its own queries ("Packets out
+        // of order", prepare() returns false). A child that exits cleanly
+        // sends COM_QUIT on it instead, and the next one starts on a closed
+        // connection. So close it here. The supervisor makes no more queries,
+        // and each child opens its own connection below.
+        PDODB::disconnect();
         $service_child_pid = pcntl_fork();
         if ($service_child_pid < 0) {
             Service_Log_message(
@@ -297,6 +325,7 @@ function Service_persist($service_name)
             $service_child_pid = 0;
         } elseif ($service_child_pid == 0) {
             Service_Unregister_Signal_handler();
+            DatabaseManager::getLink();
             Service_Log_message(
                 $service_logpath,
                 $service_name,

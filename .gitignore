@@ -37,7 +37,6 @@ ehthumbs.db
 Thumbs.db
 *~
 *#
-.vscode/settings.json
 
 # Video #
 #########
@@ -55,18 +54,28 @@ Thumbs.db
 # Imported Images #
 ###################
 packages/web/management/other/*
-packages/web/management/languages/*
+packages/web/management/languages/*/**/*.mo
 !packages/web/management/other/index.php
 !packages/web/management/other/gpl-3.0.txt
+packages/web/service/ipxe/backup
 
 # Config file #
 ###############
 *config.class.php
 # Written by the installer from $fogprogramdir (GH-850), like config.class.php
 packages/web/commons/fogpaths.php
+# Generated from the commit graph by .githooks/lib/write-version-file.sh --
+# on commit, checkout and merge, and by bin/installfog.sh. FOG_VERSION is
+# `git rev-list master..HEAD --count`, so a tracked copy differs per branch,
+# lives on one line, and makes every pair of open branches conflict on it
+# (GH-1510, GH-1513). src/Base/System.php falls back to the release constants
+# it carries when this file is absent.
+packages/web/commons/version.php
 *.well-known
 packages/web/fog
 packages/web/.vscode
+.vscode/settings.json
+
 
 # Erroneous Packages #
 ######################
@@ -74,8 +83,7 @@ packages/FOGService.msi
 packages/web/client/FOGService.msi
 packages/web/management/bower_components
 packages/web/management/dist
-packages/web/management/plugins
-packages/web/service/ipxe/bzImage*
+packages/web/service/ipxe/*Image*
 packages/web/service/ipxe/init*.xz
 packages/web/service/ipxe/*.sha256
 rpttmp
@@ -84,15 +92,44 @@ tmp/*
 # Local Scripts #
 #################
 packages/web/status/injectHosts.php
-packages/web/lib/plugins/hostext
 
-# kernel images
-*Image*
-*.cache*
-*.idea*
+# Non-fog Plugins #
+###################
+packages/web/lib/plugins/hostext
+# pycharm folders #
+###################
+**.idea
+**.sass-cache
+# php-cs-fixer.cache #
+######################
+.php-cs-fixer.cache
 
 **/*/.claude
+**/.claude
 
+# Agent skill docs (local-only, used by mattpocock/skills) #
+###########################################################
+docs/agents/
+CONTEXT.md
+CONTEXT-MAP.md
+# docs/adr/ is deliberately NOT ignored. ADRs record why a decision was
+# taken, which is only useful to a contributor if it ships with the code.
+skills-lock.json
 # GH-959: iPXE binaries now come from FOGProject/fog-ipxe as a release asset.
 # packages/tftp is a staging directory the installer fills at runtime.
 /packages/tftp/
+
+# ADR 0009: the bundled plugins now come from FOGProject/fog-plugins as a
+# release asset, pinned by FOG_PLUGINS_VERSION. packages/web/lib/plugins is a
+# staging directory bin/fetch-plugins.sh fills, the same arrangement as
+# packages/tftp above. A fresh clone has no plugins until that script is run,
+# which the installer does for you.
+/packages/web/lib/plugins/
+
+# Root-level dev tooling (PHPStan). Anchored with a leading slash so it matches
+# ONLY the repo root -- packages/web/vendor is the shipped application's
+# dependency tree and stays tracked. Nothing here reaches a FOG server:
+# copybacktrunk.sh rsyncs packages/web/ and the installer never reads the repo
+# root, so a static analyser cannot be deployed by accident.
+/vendor/
+/.phpstan-cache/

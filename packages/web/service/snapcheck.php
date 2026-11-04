@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Router\Route;
+
 /**
  * Checks the snapin.
  *
@@ -19,57 +23,60 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
 try {
     FOGCore::getHostItem(false);
     if (!FOGCore::$Host->isValid()) {
-        throw new Exception('#!ih');
+        throw new \Exception('#!ih');
     }
-    $SnapinJob = FOGCore::$Host
-        ->get('snapinjob');
+    $SnapinJob = FOGCore::$Host->get('snapinjob');
     if (!$SnapinJob->isValid()) {
-        throw new Exception(0);
+        throw new \Exception(0);
     }
-    $snapinids = FOGCore::getSubObjectIDs(
-        'SnapinTask',
-        array(
-            'stateID' => $FOGCore->getQUeuedStates(),
-            'jobID' => $SnapinJob->get('id')
-        ),
+    $find = [
+        'stateID' => $FOGCore->getQueuedStates(),
+        'jobID' => $SnapinJob->get('id')
+    ];
+    $snapins = Route::getIds(
+        'snapintask',
+        $find,
         'snapinID'
     );
+    $snapinIDs = $snapins;
     if (isset($_REQUEST['getSnapnames'])) {
-        $snapins = FOGCore::getSubObjectIDs(
-            'Snapin',
-            array('id' => $snapinids),
+        $snapins = Route::getIds(
+            'snapin',
+            ['id' => $snapinIDs],
             'name'
         );
+        $snapinnames = $snapins;
     } elseif (isset($_REQUEST['getSnapargs'])) {
-        $snapins = FOGCore::getSubObjectIDs(
-            'Snapin',
-            array('id' => $snapinids),
+        $snapins = Route::getIds(
+            'snapin',
+            ['id' => $snapinIDs],
             'args'
         );
+        $snapinnames = $snapins;
     } else {
-        $snapins = (
-            FOGCore::getClass('SnapinTaskManager')
-            ->count(
-                array(
-                    'stateID' => FOGCore::getQueuedStates(),
-                    'jobID' => $SnapinJob->get('id')
-                )
-            ) ?
-            1 :
-            0
-        );
+        $snapinnames = [count($snapins ?: []) ? 1 : 0];
     }
-    echo implode(' ', (array)$snapins);
-} catch (Exception $e) {
-    // Aisle 021: the MAC is reflected raw into this error text on dev (there is
-    // no upstream stripAndDecodeItem normalisation as on 1.6), so escape at the
-    // sink. Only the catch path: the success echo above carries snapin names and
-    // args (quotes, ampersands) which must stay byte-exact or client-side snapin
-    // execution breaks.
+    echo implode(' ', $snapinnames);
+} catch (\Exception $e) {
+    // Aisle 021: escape the error text at the sink. Today the reflected MAC is
+    // already neutralised upstream by stripAndDecodeItem(), so this is inert --
+    // but that makes the safety of this echo an accident of a shared helper.
+    // Escaping here keeps the sink safe if that helper is ever "fixed" for the
+    // cosmetic double-encoding. Only the catch path: the success echo above
+    // carries snapin names/args (quotes, ampersands) and must stay raw.
     echo Initiator::e($e->getMessage());
 }
 exit;

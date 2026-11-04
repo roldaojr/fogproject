@@ -3,22 +3,19 @@
 # Runs every test in this directory and reports one line each.
 #
 # The convention these tests already follow -- standalone scripts, exit 0 for
-# pass and non-zero for fail, no framework and no database -- had no runner,
-# so "the test suite passes" meant a human remembering seven commands. One
-# copy of the invocation, so CI and a developer run the identical thing: the
-# same reason .githooks/lib/update-language.sh exists.
+# pass and non-zero for fail, no framework and no database (docs/adr/0008
+# -secure-boot-enrollment-task-type.md:103,144) -- was documented but had no
+# runner, so "the test suite passes" meant a human remembering four commands.
+# That is the same reason .githooks/lib/update-language.sh exists: one copy of
+# the invocation, so the hook, CI and a developer all run the identical thing.
 #
-# Ported from working-1.6, where it was written, and kept as close to
-# identical as the branches allow so the two do not drift.
-#
-# Deliberately NOT wired into .githooks/pre-commit. That hook has no blocking
-# gate on this branch at all, and adding the first one changes how every
-# commit here behaves -- a separate decision from having a runner.
+# Deliberately NOT wired into .githooks/pre-commit. The hook's only blocking
+# gate is schemaCheck, and adding a second one is a change to how every commit
+# in this repository behaves -- a separate decision from having a runner at all.
 # CI (FOGProject/fog-workflows) is where this belongs.
 #
-# A test may skip: exit 0 having printed a line containing "SKIP" -- for a
-# test whose tooling is not installed. None here do yet; the convention is
-# carried across so a ported test behaves the same on both branches.
+# A test may skip: exit 0 having printed a line containing "SKIP".
+# secureboot-authvars.test.sh does this when efitools is absent.
 #
 # Usage: sh tests/run-all.sh
 # Exit status 0 = every test passed or skipped, 1 = at least one failed.

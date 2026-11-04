@@ -14,6 +14,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Router\Route;
+
 /**
  * Get version, used for multiple things.
  * The new fog client uses this to tell a client to update.
@@ -27,8 +31,17 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
-$clientUpdate = (bool) FOGCore::getSetting('FOG_CLIENT_AUTOUPDATE');
+$clientUpdate = (bool)FOGCore::getSetting('FOG_CLIENT_AUTOUPDATE');
 if (isset($_REQUEST['client'])) {
     $ver = (
         $clientUpdate ?
@@ -41,11 +54,25 @@ if (isset($_REQUEST['client'])) {
         FOG_CLIENT_VERSION :
         '0.0.0'
     );
+} elseif (isset($_REQUEST['caps'])) {
+    /*
+     * Space-separated feature tokens probed by FOS before it relies on
+     * server-side behavior a version string can't identify. An older
+     * server answers this query with FOG_VERSION (no tokens), which
+     * probing clients treat as "capability absent".
+     *
+     * mclvm: multicast tasks emit per-LV LVM image files in sidecar
+     * order (fos docs/adr/0007).
+     *
+     * mcstreamid: every multicast stream is prefixed with a fixed-width
+     * header naming the image file it carries, so a receiver can refuse
+     * a stream that is not the one it asked for (issue #1742). A client
+     * that sees this token strips and checks the header; one that does
+     * not must not, or it would eat 128 bytes of payload.
+     */
+    $ver = 'mclvm mcstreamid';
 } elseif (isset($_REQUEST['url'])) {
-
-    // Prevent an unauthenticated user from making arbitrary requests.
     FOGCore::checkAuthAndCSRF();
-
     $url = $_REQUEST['url'];
 
     $parts = parse_url($url);
@@ -64,7 +91,7 @@ if (isset($_REQUEST['client'])) {
     }
 
     // Only allow other storage nodes:
-    $allowedStorageNodes = FOGCore::getSubObjectIDs('StorageNode', '', 'ip');
+    $allowedStorageNodes = Route::getIds('storagenode', [], 'ip');
     $host = strtolower($parts['host']);
     if (!in_array($host, array_map('strtolower', $allowedStorageNodes), true)) {
         http_response_code(403);
@@ -82,7 +109,7 @@ if (isset($_REQUEST['client'])) {
     // restrict query params to known ones
     if (!empty($parts['query'])) {
         parse_str($parts['query'], $q);
-        $allowedKeys = ['client', 'clientVer'];
+        $allowedKeys = ['client', 'clientver', 'caps'];
         foreach (array_keys($q) as $k) {
             if (!in_array($k, $allowedKeys, true)) {
                 http_response_code(403);

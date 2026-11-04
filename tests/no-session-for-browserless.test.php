@@ -2,7 +2,7 @@
 /**
  * Browser-less entry points must not be handed a session.
  *
- * Initiator used to call session_start() unconditionally, and 59 entry
+ * Initiator used to call session_start() unconditionally, and 62 entry
  * points reach it through commons/base.inc.php. Everything under service/
  * and status/, the API and the iPXE endpoints inherited it -- and none of
  * them can carry a cookie back, so each request allocated a session record
@@ -15,7 +15,7 @@
  *
  * Static on purpose: proving it over HTTP needs a running server with a
  * database, and a test that needs those is a test nobody runs. The HTTP
- * behaviour was verified by hand when the change landed -- see the PR.
+ * behavior was verified by hand when the change landed -- see the PR.
  *
  * Usage: php tests/no-session-for-browserless.test.php
  * Exit status 0 = pass, 1 = fail.
@@ -65,12 +65,11 @@ if (false === strpos($src, 'session_name()')) {
  */
 $declarers = [];
 foreach (['packages/web/service', 'packages/web/status', 'packages/web/api',
-    'packages/web/management', 'packages/web/maintenance',
-    'packages/web/client'] as $dir) {
+    'packages/web/management', 'packages/web/maintenance'] as $dir) {
     if (!is_dir($dir)) {
         continue;
     }
-    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+    $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($dir));
     foreach ($it as $f) {
         if (!$f->isFile() || 'php' !== $f->getExtension()) {
             continue;
@@ -103,7 +102,7 @@ foreach ($browserless as $dir) {
     if (!is_dir($dir)) {
         continue;
     }
-    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+    $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($dir));
     foreach ($it as $f) {
         if (!$f->isFile() || 'php' !== $f->getExtension()) {
             continue;

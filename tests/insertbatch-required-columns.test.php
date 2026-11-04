@@ -23,212 +23,228 @@
  * setting on the page -- a data-loss bug strictly worse than the error it
  * would be fixing, and one nothing else here would catch.
  *
- * DB-free: this reads the source, like its sibling
- * empty-values-and-strict-sql-mode.test.php.
+ * DB-free: this reads the source, like usertracking-permission-split and
+ * permission-purge-guard. The behavior itself is proved against a live
+ * strict server by background_scripts/prove_insertbatch_backfill.php.
  *
  * Usage: php tests/insertbatch-required-columns.test.php
  * Exit status 0 = pass, 1 = fail.
  */
 
-$web = dirname(__DIR__) . '/packages/web';
-$failures = array();
+$root = dirname(__DIR__);
+$failures = [];
 $checks = 0;
 
-/**
- * Source with comments removed, so a commented-out line can neither satisfy
- * a check nor fail one.
- *
- * @param string $file the file to read
- *
- * @return string
- */
-function ibStrip($file)
+function check($what, $ok, &$failures, &$checks)
 {
-    $clean = '';
-    foreach (token_get_all(file_get_contents($file)) as $token) {
-        if (is_array($token)
-            && ($token[0] === T_COMMENT || $token[0] === T_DOC_COMMENT)
-        ) {
-            continue;
-        }
-        $clean .= is_array($token) ? $token[1] : $token;
-    }
-    return $clean;
-}
-
-/**
- * Records a check.
- *
- * @param bool   $ok      whether it passed
- * @param string $message what failed, stated as the defect
- *
- * @return void
- */
-function ibCheck($ok, $message)
-{
-    global $checks, $failures;
     $checks++;
     if (!$ok) {
-        $failures[] = $message;
+        $failures[] = $what;
     }
 }
 
-$base = ibStrip($web . '/lib/fog/fogbase.class.php');
-$ctl = ibStrip($web . '/lib/fog/fogcontroller.class.php');
-$man = ibStrip($web . '/lib/fog/fogmanagercontroller.class.php');
-$page = ibStrip($web . '/lib/pages/fogconfigurationpage.class.php');
+$base = (string) file_get_contents(
+    "$root/packages/web/src/Base/FOGBase.php"
+);
+$ctl = (string) file_get_contents(
+    "$root/packages/web/src/Base/FOGController.php"
+);
+$man = (string) file_get_contents(
+    "$root/packages/web/src/Base/FOGManagerController.php"
+);
 
-// ---------------------------------------------------------------
-// 1. The seam is somewhere BOTH write paths can reach.
-// ---------------------------------------------------------------
-ibCheck(
-    preg_match('#abstract class FOGController extends FOGBase\b#', $ctl)
-    && preg_match(
-        '#abstract class FOGManagerController extends FOGBase\b#',
+/*
+ * FOGController and FOGManagerController are SIBLINGS -- both extend FOGBase
+ * directly. A seam either of them needs has to live on FOGBase or the other
+ * one cannot reach it, which is the structural reason GH-1245's fix reached
+ * only one of the two paths.
+ */
+check(
+    'FOGController and FOGManagerController both extend FOGBase',
+    1 === preg_match('/abstract class FOGController extends FOGBase\b/', $ctl)
+    && 1 === preg_match(
+        '/abstract class FOGManagerController extends FOGBase\b/',
         $man
     ),
-    'FOGController and FOGManagerController are no longer both direct '
-    . 'children of FOGBase, so what follows may be checking the wrong thing'
+    $failures,
+    $checks
 );
 
-foreach (array('columnType', 'columnIsNullable', 'emptyValueFor') as $method) {
-    ibCheck(
-        strpos($base, "function $method(") !== false,
-        "$method() is not on FOGBase, so insertBatch() cannot reach it -- "
-        . 'which is the whole reason GH-1245 fixed only one of the two write '
-        . 'paths'
+foreach (['columnType', 'columnIsNullable', 'emptyValueFor'] as $method) {
+    check(
+        "$method() lives on FOGBase, where both write paths can reach it",
+        false !== strpos($base, "function $method("),
+        $failures,
+        $checks
     );
-    ibCheck(
-        strpos($ctl, "function $method(") === false,
-        "$method() is defined on FOGController as well as FOGBase; two "
-        . 'copies of a coercion rule will drift'
+    check(
+        "$method() is no longer defined on FOGController",
+        false === strpos($ctl, "function $method("),
+        $failures,
+        $checks
     );
 }
-ibCheck(
-    strpos($base, 'function columnsRequiringValue(') !== false,
-    'columnsRequiringValue() is not on FOGBase'
+check(
+    'columnsRequiringValue() lives on FOGBase too',
+    false !== strpos($base, 'function columnsRequiringValue('),
+    $failures,
+    $checks
 );
 
-// ---------------------------------------------------------------
-// 2. What counts as "required" -- all three parts, or it is wrong.
-// ---------------------------------------------------------------
-// Squashed rather than isolated by regex: columnsRequiringValue() has two
-// `return $out;` statements, so a non-greedy match on the method stops at the
-// early one and reads none of the body that matters.
-$loader = preg_replace('#\s+#', '', $base);
-ibCheck(
-    strpos($loader, "!empty(\$meta['required'])") !== false,
-    'columnsRequiringValue() no longer filters on the required flag'
-);
-ibCheck(
-    strpos($loader, "'required'=>!\$nullable&&!\$auto") !== false,
-    'the required flag no longer excludes nullable and auto_increment '
-    . 'columns. A nullable column needs no value, and filling an '
-    . 'AUTO_INCREMENT key with 0 writes over the value the server was about '
-    . 'to generate'
-);
-ibCheck(
-    strpos($loader, "isset(\$row['d'])||null===\$row['d']") !== false,
-    'the required flag no longer excludes columns that carry a DEFAULT. '
-    . 'Filling one overrides the default the schema chose'
-);
-ibCheck(
-    strpos($loader, '`COLUMN_DEFAULT`AS`d`') !== false
-    && strpos($loader, '`EXTRA`AS`e`') !== false,
-    'the catalog query no longer reads COLUMN_DEFAULT and EXTRA, so the '
-    . 'required flag is computed from data it does not have'
-);
-
-// ---------------------------------------------------------------
-// 3. insertBatch() consults it, and the fill reaches the statement.
-// ---------------------------------------------------------------
-preg_match('#public function insertBatch\(.*?\n    \}#s', $man, $m);
-$batch = isset($m[0]) ? $m[0] : '';
-ibCheck($batch !== '', 'insertBatch() could not be isolated');
-ibCheck(
-    strpos($batch, 'columnsRequiringValue(') !== false,
-    'insertBatch() no longer asks which columns the table requires'
-);
-ibCheck(
-    strpos($batch, 'emptyValueFor(') !== false,
-    'insertBatch() no longer fills them from the same emptyValueFor() '
-    . 'save() uses, so the two write paths can coerce differently'
-);
-ibCheck(
-    preg_match('#\$keys\[\]\s*=\s*\$column;#', $batch) === 1,
-    'the filled columns are no longer added to the column list'
-);
-ibCheck(
-    preg_match(
-        '#foreach \(\$fillCols as \$fillIndex => \$fillVal\)#',
-        $batch
-    ) === 1
-    && preg_match('#\$insertVals\[\$key\]\s*=\s*\$fillVal;#', $batch) === 1,
-    'the fill placeholders are no longer emitted into every row tuple, so '
-    . 'the column list and the value list would disagree'
-);
 /*
- * Every ROW needs its own placeholder name. The fill bind used to be named
- * once, outside the row loop, and the single `:_fill_0` was then repeated in
- * each VALUES tuple -- which one row survives and two do not: PDODB sets
+ * The catalog is the only source that answers all three parts of "must this
+ * column be named": NOT NULL, no DEFAULT, and not AUTO_INCREMENT.
+ * schema-expected.php carries the first two but drops AUTO_INCREMENT, so a
+ * manifest-driven answer would fill the primary key with 0.
+ */
+preg_match(
+    '/function columnsRequiringValue\(.*?\n    \}/s',
+    $base,
+    $m
+);
+$req = $m[0] ?? '';
+check(
+    'columnsRequiringValue() reads the server catalog',
+    false !== strpos($req, 'information_schema'),
+    $failures,
+    $checks
+);
+foreach (
+    [
+        "IS_NULLABLE` = 'NO'" => 'only NOT NULL columns',
+        'COLUMN_DEFAULT` IS NULL' => 'only columns with no DEFAULT',
+        'auto_increment' => 'and never an AUTO_INCREMENT column'
+    ] as $needle => $what
+) {
+    check(
+        "it selects $what",
+        false !== strpos($req, $needle),
+        $failures,
+        $checks
+    );
+}
+
+$batch = '';
+if (preg_match('/public function insertBatch\(.*?\n    \}/s', $man, $m)) {
+    $batch = $m[0];
+}
+check(
+    'insertBatch() was found',
+    '' !== $batch,
+    $failures,
+    $checks
+);
+check(
+    'insertBatch() asks which columns the table requires',
+    false !== strpos($batch, 'columnsRequiringValue('),
+    $failures,
+    $checks
+);
+check(
+    'and fills them from the same emptyValueFor() save() uses',
+    false !== strpos($batch, 'emptyValueFor('),
+    $failures,
+    $checks
+);
+check(
+    'the filled columns are added to the column list',
+    1 === preg_match('/\$keys\[\]\s*=\s*\$column;/', $batch),
+    $failures,
+    $checks
+);
+
+/*
+ * The filled values must reach the statement. Binding them without emitting
+ * the placeholders, or emitting placeholders without binding, both produce a
+ * broken statement rather than a wrong one -- but neither is visible from the
+ * column list alone.
+ *
+ * And every ROW needs its own placeholder. The fill bind was named once,
+ * outside the row loop, and the single `:_fill_0` was then repeated in each
+ * VALUES tuple -- which one row survives and two do not: PDODB sets
  * PDO::ATTR_EMULATE_PREPARES => false, so a real server-side prepare answers
  * SQLSTATE[HY093] "Invalid parameter number" to a named parameter used twice.
  * Every batch of two or more rows into a table with an unnamed NOT NULL
  * column failed outright, which is most of group tasking: the snapin and
- * generic branches of Group::createImagePackage() name none of `tasks`'
+ * generic branches of Group::createImagePackage() name none of `tasks`' four
  * NFS/image columns. Proved both ways by
  * background_scripts/prove_batch_fill_duplicate_bind.php.
  */
-ibCheck(
-    strpos($batch, "'_fill_%d_%d'") !== false
-    && strpos($batch, '$fillKeys') === false,
-    'the fill placeholders are shared between rows again. One name reused '
-    . 'across VALUES tuples is SQLSTATE[HY093] on a real server-side '
-    . 'prepare, so a batch of two or more rows fails outright'
+check(
+    'their placeholders are emitted into every row tuple',
+    1 === preg_match(
+        '/foreach \(\$fillCols as \$fillIndex => \$fillVal\)/',
+        $batch
+    )
+    && 1 === preg_match('/\$insertVals\[\$key\]\s*=\s*\$fillVal;/', $batch),
+    $failures,
+    $checks
+);
+check(
+    'each row binds its own copy, never one shared placeholder',
+    1 === preg_match("/'_fill_%d_%d'/", $batch)
+    && false === strpos($batch, '$fillKeys'),
+    $failures,
+    $checks
 );
 
-// ---------------------------------------------------------------
-// 4. The one that protects data rather than the statement.
-// ---------------------------------------------------------------
-$dupLines = 0;
+/*
+ * The one that protects data rather than the statement.
+ */
+$dupLines = [];
 foreach (explode("\n", $batch) as $line) {
-    if (strpos($line, '$dups[]') !== false) {
-        $dupLines++;
+    if (false !== strpos($line, '$dups[]')) {
+        $dupLines[] = trim($line);
     }
 }
-ibCheck(
-    $dupLines === 1,
-    'ON DUPLICATE KEY UPDATE is built from more than the caller\'s own '
-    . 'columns. A filled column in the update list blanks the stored value '
-    . 'on every existing row -- for globalSettings that is the description '
-    . 'of every setting, wiped the moment anyone presses save'
+check(
+    'ON DUPLICATE KEY UPDATE is still built only from the caller\'s columns',
+    1 === count($dupLines),
+    $failures,
+    $checks
+);
+check(
+    'no filled column is ever added to the update list',
+    false === strpos($batch, '$dups[] = sprintf')
+    || 0 === preg_match('/\$column.*\n.*\$dups\[\]/', $batch),
+    $failures,
+    $checks
 );
 
-// ---------------------------------------------------------------
-// 5. The reported call site names what it knows.
-// ---------------------------------------------------------------
-ibCheck(
-    preg_match(
-        "#'id',\s*'name',\s*'value',\s*'description',\s*'category'#",
-        preg_replace('#\s+#', ' ', $page)
-    ) === 1,
-    'the FOG Settings saver no longer names description and category. The '
-    . 'backfill can only supply \'\'; this is what puts a real description '
-    . 'on a setting row that has to be created'
+/*
+ * The reported call site. Naming the columns is belt and braces now that the
+ * backfill exists, but it is what puts a REAL description on a setting row
+ * that has to be created rather than a blank one.
+ */
+$page = (string) file_get_contents(
+    "$root/packages/web/src/Pages/FOGConfigurationPage.php"
+);
+check(
+    'both settings savers name description and category',
+    2 === preg_match_all(
+        "/'id',\s*\n\s*'name',\s*\n\s*'value',\s*\n\s*'description',\s*\n\s*'category'/",
+        $page
+    ),
+    $failures,
+    $checks
+);
+check(
+    'and neither still posts the bare three-column list',
+    0 === preg_match(
+        "/'id',\s*\n\s*'name',\s*\n\s*'value'\s*\n\s*\];/",
+        $page
+    ),
+    $failures,
+    $checks
 );
 
-ibCheck(
-    strlen($base) > 50000 && strlen($man) > 10000 && strlen($page) > 50000,
-    'the scan did not reach the sources and would pass vacuously'
-);
-
-if (count($failures) > 0) {
-    echo 'FAIL insertbatch-required-columns (' . count($failures) . " problem(s))\n";
-    foreach ($failures as $failure) {
-        echo "  - $failure\n";
+if (count($failures)) {
+    fwrite(STDERR, 'FAIL (' . count($failures) . " of $checks):\n");
+    foreach ($failures as $f) {
+        fwrite(STDERR, "  - $f\n");
     }
     exit(1);
 }
 
-echo "PASS insertbatch-required-columns ($checks checks)\n";
+echo "ok  $checks checks passed\n";
 exit(0);

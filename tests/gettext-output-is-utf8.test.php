@@ -46,15 +46,31 @@ if (!function_exists('bind_textdomain_codeset')) {
 }
 
 /*
- * language() is a pure static: it touches no database and Initiator's
- * constructor is never run here, so including the file is the whole
- * bootstrap.
+ * Booting the autoloader is enough to reach language() -- Initiator's
+ * constructor only registers it, and language() is a pure static that touches
+ * no database. FOG_CACHE_DIR and friends are redirected into a throwaway
+ * directory first; see the long note in tests/autoload.test.php for why that
+ * line must never become conditional.
  */
-require_once $root . '/packages/web/commons/init.php';
+$tmp = sys_get_temp_dir() . '/fog-gettext-test-' . getmypid();
+@mkdir($tmp . '/cache', 0700, true);
+@mkdir($tmp . '/log', 0700, true);
+register_shutdown_function(
+    function () use ($tmp) {
+        foreach (glob($tmp . '/*/*') ?: [] as $f) {
+            @unlink($f);
+        }
+        foreach (glob($tmp . '/*') ?: [] as $d) {
+            @rmdir($d);
+        }
+        @rmdir($tmp);
+    }
+);
+define('FOG_CACHE_DIR', $tmp . '/cache');
+define('FOG_LOG_DIR', $tmp . '/log');
+define('FOG_PLUGIN_DIR', $tmp . '/plugins');
 
-// Somewhere harmless to point the domain at while poisoning its codeset.
-// bindtextdomain() only records the path; nothing is read or written.
-$elsewhere = sys_get_temp_dir();
+require_once $root . '/packages/web/commons/init.php';
 
 $langs = ['de', 'en', 'es', 'eu', 'fr', 'it', 'pt', 'zh', 'ja'];
 
@@ -70,7 +86,7 @@ if (PHP_VERSION_ID >= 80000) {
         // Bind the domain somewhere harmless and poison the codeset first. A
         // codeset set by an earlier iteration survives, so without this the
         // whole loop would pass on the strength of one call.
-        bindtextdomain('messages', $elsewhere);
+        bindtextdomain('messages', $tmp);
         bind_textdomain_codeset('messages', 'ISO-8859-1');
 
         Initiator::language($lang);

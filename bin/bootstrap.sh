@@ -1,0 +1,613 @@
+#!/bin/bash
+#
+#  FOG is a computer imaging solution.
+#  Copyright (C) 2007  Chuck Syperski & Jian Zhang
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#    any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# GH-1006. Gets FOG onto a machine that has nothing on it yet:
+#
+#   curl -fsSL https://raw.githubusercontent.com/FOGProject/fogproject/stable/bin/bootstrap.sh | bash
+#
+# Installs git, clones the repository, checks out the branch for the requested
+# channel, and runs installfog.sh. Nothing else -- once the clone exists,
+# installfog.sh and bin/updatefog.sh own everything that happens after.
+#
+# WHY THIS FILE DUPLICATES detectOSFamily() AND THE CHANNEL MAP
+#
+# It has to be self-contained. It runs BEFORE there is a clone, so it cannot
+# source lib/common/functions.sh -- the file does not exist on the machine yet,
+# and fetching 300+ KB of installer over HTTP to reach twelve lines of
+# /etc/os-release parsing would be worse than copying the twelve lines.
+#
+# The original design for this script called for extracting the detection into
+# functions.sh "so bootstrap.sh and installfog.sh share one implementation".
+# That is not achievable in the pre-clone half and pretending otherwise would
+# have produced a script that could not run. The extraction was worth doing on
+# its own merits and was done -- installfog.sh and lib/common/input.sh now both
+# call detectOSFamily() instead of carrying a copy each -- but this file is not
+# one of its callers. tests/detect-os-family.test.sh runs BOTH copies over the
+# same distro names and fails if they ever disagree, which is the honest way to
+# hold two implementations together when one of them cannot import the other.
+#
+# NO `set -e`, matching every other script in this repository. Failures are
+# handled where they happen, so a partial failure can say what it was.
+#
+# Exit codes match installfog.sh's where the failure is the same one:
+#   1 not root        2 not Linux       3 bad argument
+#   4 unsupported distribution          5 could not install git
+#   6 clone or checkout failed          7 no terminal for an interactive install
+
+version="1.0.0"
+
+# Under `curl ... | bash` this script's stdin IS the pipe carrying its own
+# source. Exiting early leaves curl with a half-written pipe, and curl then
+# reports
+#
+#     curl: (23) Failure writing output to destination
+#
+# which reads like a download problem and buries the message that actually
+# matters. Reading the rest away lets curl finish and exit 0, so the only thing
+# left on screen is what this script said.
+#
+# BOUNDED, and only on a pipe. `cat > /dev/null` was the obvious way to write
+# this and it hangs: stdin can be an open pipe whose writer never closes -- any
+# parent process that holds the other end -- and then the drain waits forever
+# for an EOF that is not coming. A bootstrap that hangs instead of printing its
+# error is worse than the curl warning it was trying to suppress.
+#
+# So: only when stdin really is a pipe, in chunks, with a read timeout to end
+# it if nothing more arrives, and a hard cap so it cannot spin. The script is
+# some tens of kilobytes, so one or two chunks is the normal case.
+drainStdin() {
+    [[ -p /dev/stdin ]] || return 0
+    local discard i=0
+    while [[ $i -lt 64 ]] && IFS= read -r -t 2 -n 65536 discard 2>/dev/null; do
+        i=$((i + 1))
+    done
+    return 0
+}
+
+usage() {
+    echo -e "Usage: curl -fsSL <url>/bootstrap.sh | bash -s -- [options]"
+    echo -e "       $0 [options]\n"
+    echo -e "\t-h -? --help\t\tDisplay this info"
+    echo -e "\t      --channel\t\tWhich line to install: stable, patches, beta"
+    echo -e "\t              \t\tor rc. Defaults to stable"
+    echo -e "\t      --branch\t\tCheck out a literal branch or tag instead of a"
+    echo -e "\t              \t\tchannel, for testing a PR or feature branch"
+    echo -e "\t      --git-path\tWhere to clone to. Defaults to /root/fogproject"
+    echo -e "\t-y    --yes\t\tRun the installer unattended (-Y). Without it the"
+    echo -e "\t              \t\tinstaller runs interactively, which is what a"
+    echo -e "\t              \t\tfirst install wants. Pass it from Ansible/cloud-init"
+    echo -e "\n\tThis script only gets FOG onto the machine. Afterward,"
+    echo -e "\tbin/updatefog.sh moves it between channels and bin/installfog.sh"
+    echo -e "\tdoes everything else."
+    exit 0
+}
+
+fail() {
+    echo
+    echo " * $1"
+    shift
+    while [[ $# -gt 1 ]]; do
+        echo " | $1"
+        shift
+    done
+    echo
+    drainStdin
+    exit "$1"
+}
+
+repo="https://github.com/FOGProject/fogproject.git"
+# Where this script fetches ITSELF from, for the piped elevation path below.
+# Overridable, because the constant names one branch and a copy taken from
+# another would otherwise be replaced by working-1.6's.
+selfurl="${FOG_BOOTSTRAP_URL:-https://raw.githubusercontent.com/FOGProject/fogproject/stable/bin/bootstrap.sh}"
+gitpath="/root/fogproject"
+channel="stable"
+branch=""
+autoYes=""
+
+# Kept before the option loop shifts them away: the elevation below re-runs
+# this script and needs the arguments as they were given.
+origArgs=("$@")
+
+# Hand-rolled rather than getopt(1), because getopt is part of util-linux and
+# this script runs before any package has been installed. On a minimal image it
+# is usually there and occasionally is not, and a bootstrap that dies parsing
+# its own arguments is the worst possible first impression.
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h | -\? | --help)
+            usage
+            ;;
+        --channel)
+            [[ -n $2 ]] || fail "--channel requires a value" 3
+            channel="$2"
+            shift 2
+            ;;
+        --branch)
+            [[ -n $2 ]] || fail "--branch requires a value" 3
+            branch="$2"
+            shift 2
+            ;;
+        --git-path)
+            [[ -n $2 && $2 == /* ]] || fail "--git-path requires an absolute path" 3
+            gitpath="${2%/}"
+            shift 2
+            ;;
+        -y | --yes)
+            autoYes=1
+            shift
+            ;;
+        *)
+            fail "Unknown option: $1" "Run with --help for the list." 3
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Get to root, rather than refuse and make the user retype the command.
+#
+# TWO SHAPES, because a piped script cannot re-run itself: $0 is `bash`, not a
+# file, and stdin has already been partly consumed by the time control reaches
+# here.
+#
+#   From a FILE -- exec sudo on $0. Clean, and the bytes that run as root are
+#                  the bytes already on disk, which the admin can have read.
+#
+#   From a PIPE -- there is nothing on disk for sudo to run, so the script is
+#                  FETCHED A SECOND TIME and that copy is piped to sudo bash.
+#
+# THE SECOND FETCH IS WORTH KNOWING ABOUT, so it is printed before it happens
+# rather than done quietly. The URL tracks a branch, so if a push lands between
+# the two downloads the copy that runs as root is not the copy that was read.
+# FOG_BOOTSTRAP_URL points it elsewhere; the documented `| sudo bash` form
+# avoids the second fetch entirely and is what the docs lead with.
+#
+# FOG_BOOTSTRAP_ELEVATED stops a loop. If sudo succeeds and the child is still
+# not root -- a sudoers rule that grants a different user, say -- it must not
+# fetch and elevate again.
+elevate() {
+    [[ -z $FOG_BOOTSTRAP_ELEVATED ]] || return 1
+    command -v sudo >/dev/null 2>&1 || return 1
+
+    if [[ -f $0 ]]; then
+        echo " * Not running as root. Re-running this file under sudo:"
+        echo " |"
+        echo " |   sudo bash $0 ${origArgs[*]}"
+        echo
+        drainStdin
+        exec sudo env FOG_BOOTSTRAP_ELEVATED=1 bash "$0" "${origArgs[@]}"
+    fi
+
+    # Piped, so there is no file to hand sudo.
+    command -v curl >/dev/null 2>&1 || return 1
+    echo " * Not running as root, and this script arrived over a pipe -- so"
+    echo " | there is no file on disk for sudo to run. Fetching it again and"
+    echo " | running that copy as root:"
+    echo " |"
+    echo " |   curl -fsSL ${selfurl} | sudo bash -s -- ${origArgs[*]}"
+    echo " |"
+    echo " | This downloads the script a second time, so what runs as root is"
+    echo " | not guaranteed to be the byte-for-byte copy you just read. To avoid"
+    echo " | that, interrupt now and fetch it once to a file instead:"
+    echo " |"
+    echo " |   curl -fsSL -o bootstrap.sh ${selfurl}"
+    echo " |   less bootstrap.sh"
+    echo " |   sudo bash bootstrap.sh ${origArgs[*]}"
+    echo
+    drainStdin
+    exec sudo env FOG_BOOTSTRAP_ELEVATED=1 bash -c         'url="$1"; shift; curl -fsSL "$url" | bash -s -- "$@"' _ "$selfurl" "${origArgs[@]}"
+}
+
+if [[ ! $EUID -eq 0 ]]; then
+    elevate
+    # Only reached when elevation could not happen. Say which of the three
+    # reasons it was, because the fix differs for each.
+    echo "FOG Installation must be run as root user"
+    echo
+    if [[ -n $FOG_BOOTSTRAP_ELEVATED ]]; then
+        echo " | sudo ran, and this is still not root -- so a sudoers rule sent"
+        echo " | it somewhere other than root. Run it as root directly."
+    elif ! command -v sudo >/dev/null 2>&1; then
+        echo " | sudo is not installed here. Become root first:"
+        echo " |"
+        echo " |   su -"
+        echo " |   curl -fsSL ${selfurl} | bash -s -- ${origArgs[*]}"
+    else
+        echo " | curl is not available to fetch this script again, which is how"
+        echo " | a piped run reaches root. Fetch it to a file instead:"
+        echo " |"
+        echo " |   wget -O bootstrap.sh ${selfurl}"
+        echo " |   sudo bash bootstrap.sh ${origArgs[*]}"
+    fi
+    drainStdin
+    exit 1
+fi
+
+[[ -z $OS ]] && OS=$(uname -s)
+if [[ ! $(echo "$OS" | tr "[:upper:]" "[:lower:]") =~ "linux" ]]; then
+    echo "We do not currently support Installation on non-Linux Operating Systems"
+    exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Which distro family, and therefore which package manager.
+#
+# A copy of detectOSFamily() from lib/common/functions.sh -- see the note at the
+# top of this file for why it cannot be the same copy, and
+# tests/detect-os-family.test.sh for what keeps the two honest.
+# ---------------------------------------------------------------------------
+detectOSFamily() {
+    if [[ -f /etc/os-release ]]; then
+        [[ -z $linuxReleaseName ]] && linuxReleaseName=$(sed -n 's/^NAME=\(.*\)/\1/p' /etc/os-release | tr -d '"')
+        [[ -z $OSVersion ]] && OSVersion=$(sed -n 's/^VERSION_ID=\([^.]*\).*/\1/p' /etc/os-release | tr -d '"')
+    elif [[ -f /etc/redhat-release ]]; then
+        [[ -z $linuxReleaseName ]] && linuxReleaseName=$(cat /etc/redhat-release | awk '{print $1}')
+        [[ -z $OSVersion ]] && OSVersion=$(cat /etc/redhat-release | sed s/.*release\ // | sed s/\ .*// | awk -F. '{print $1}')
+    elif [[ -f /etc/debian_version ]]; then
+        [[ -z $linuxReleaseName ]] && linuxReleaseName='Debian'
+        [[ -z $OSVersion ]] && OSVersion=$(cat /etc/debian_version)
+    fi
+    linuxReleaseName_lower=$(echo "$linuxReleaseName" | tr "[:upper:]" "[:lower:]")
+    osfamily=""
+    case $linuxReleaseName_lower in
+        *fedora*|*red*hat*|*centos*|*mageia*|*alma*|*rocky*)
+            osfamily="redhat"
+            ;;
+        *ubuntu*|*bian*|*mint*)
+            osfamily="debian"
+            ;;
+        *alpine*)
+            osfamily="alpine"
+            ;;
+        *arch*|*manjaro*)
+            osfamily="arch"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The channel map, likewise a copy -- of channelToBranch()/normalizeChannel()
+# in lib/common/functions.sh. The retired stable/staging/dev spellings are
+# honored here exactly as they are there, silently and forever: an admin who
+# pastes a command from an older forum post should get a working install, not a
+# lecture about vocabulary.
+#
+# Note what `dev` means. It is the retired spelling of BETA, not of dev-branch,
+# despite a branch by that name existing -- see normalizeChannel's comment.
+# ---------------------------------------------------------------------------
+normalizeChannel() {
+    case "$1" in
+        stable) echo "stable" ;;
+        patches|staging) echo "patches" ;;
+        beta|dev) echo "beta" ;;
+        rc) echo "rc" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Asked of the remote with ls-remote, which needs no clone -- the reason the
+# rc channel is resolved by version order rather than commit date at all, since
+# the remote ref advertisement carries no dates. -v:refname so rc-1.6.10 beats
+# rc-1.6.2.
+# refs/heads/rc-*, NOT a bare rc-*. ls-remote matches a pattern against the
+# TAIL of each ref at slash boundaries, so `rc-*` also matches
+# refs/heads/feat/rc-update-channel -- a feature branch, offered to an admin as
+# the current release candidate. Anchoring at refs/heads/ makes "rc-" mean the
+# start of the branch name rather than the start of its last path segment, and
+# the sed re-checks that on the way out: matching rules are not the place to
+# rely on one layer alone when the answer decides what gets checked out.
+rcBranch() {
+    newestBranch rc
+}
+
+# beta resolves the same way: working-1.6 is deleted at the 1.6.0 release, and
+# the next beta line carries its own name.
+betaBranch() {
+    newestBranch working
+}
+
+newestBranch() {
+    local prefix="$1" ref
+    # sort -Vr rather than git --sort=-v:refname: ls-remote --sort needs git
+    # 2.18, and this script runs on a machine whose git it has only just
+    # installed from the distro repository -- which on an older release is
+    # 1.8.3.1 or 2.17.1. There the option is a usage error and the failure is
+    # indistinguishable from "no release candidate published".
+    #
+    # No local origin to ask here, unlike functions.sh rcBranch: there is no
+    # clone yet. $repo is the constant this script clones from anyway, so the
+    # branch it resolves is one that remote definitely carries.
+    #
+    # ls-remote runs on its own, not at the head of the pipe, so a remote that
+    # could not be asked (no network) returns 3 rather than reading as an
+    # empty match -- "none published" would be a guess, not a finding.
+    local heads
+    heads=$(git ls-remote --heads "$repo" "refs/heads/${prefix}-*" 2>/dev/null) || return 3
+    ref=$(printf '%s\n' "$heads" \
+        | sed -n "s#^[0-9a-f]\\{7,\\}[[:space:]]\\{1,\\}refs/heads/\\(${prefix}-[^/]\\{1,\\}\\)\$#\\1#p" \
+        | sort -Vr \
+        | head -n1)
+    [[ -n $ref ]] || return 1
+    echo "$ref"
+}
+
+channelToBranch() {
+    case "$(normalizeChannel "$1")" in
+        stable) echo "stable" ;;
+        patches) echo "dev-branch" ;;
+        beta)
+            betaBranch
+            case $? in
+                0) ;;
+                3) return 3 ;;
+                *) return 2 ;;
+            esac
+            ;;
+        rc)
+            rcBranch
+            case $? in
+                0) ;;
+                3) return 3 ;;
+                *) return 2 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Refuse an unsupported distribution UP FRONT.
+#
+# The alternative -- install git, clone, and let installfog.sh discover it --
+# leaves a machine with packages and a checkout it cannot use, and tells the
+# person about it several minutes later.
+# ---------------------------------------------------------------------------
+if ! detectOSFamily; then
+    fail "FOG does not support this distribution: ${linuxReleaseName:-unknown}" \
+         "Supported: Red Hat family (RHEL, CentOS, Rocky, Alma, Fedora, Mageia)," \
+         "Debian family (Debian, Ubuntu, Mint), Alpine, and Arch (incl. Manjaro)." \
+         4
+fi
+
+installGit() {
+    command -v git >/dev/null 2>&1 && return 0
+    echo " * Installing git (${osfamily})"
+    case $osfamily in
+        debian)
+            apt-get -yq update
+            apt-get -yq install git
+            ;;
+        redhat)
+            # dnf where it exists, yum where it does not -- the same fallback
+            # installfog.sh uses for its own package work on this family.
+            if command -v dnf >/dev/null 2>&1; then
+                dnf -y install git
+            else
+                yum -y install git
+            fi
+            ;;
+        alpine)
+            apk add --no-cache git
+            ;;
+        arch)
+            pacman -Sy --noconfirm git
+            ;;
+    esac
+    command -v git >/dev/null 2>&1
+}
+
+if ! installGit; then
+    fail "Could not install git with this system's package manager." \
+         "Install it by hand and run this again." 5
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve the branch before touching the disk, so a bad channel costs nothing.
+# ---------------------------------------------------------------------------
+# Whether the branch was resolved FROM a channel, which is what decides if
+# --channel gets forwarded. $branch is non-empty either way by the time the
+# installer runs, so it cannot answer this itself.
+fromChannel=0
+if [[ -z $branch ]]; then
+    fromChannel=1
+    branch=$(channelToBranch "$channel")
+    case $? in
+        0) ;;
+        2)
+            if [[ $(normalizeChannel "$channel") == beta ]]; then
+                fail "No beta line is currently published, so the beta channel" \
+                     "has nothing to install. This is normal right after a release." \
+                     "" \
+                     "Install the stable line instead with --channel stable." 3
+            fi
+            fail "No release candidate is currently published, so the rc channel" \
+                 "has nothing to install. This is normal between releases." \
+                 "" \
+                 "Install the stable line instead with --channel stable." 3
+            ;;
+        3)
+            fail "Could not ask ${repo} which branch the ${channel} channel tracks." \
+                 "git ls-remote failed, so nothing is known about what is" \
+                 "published. Check this machine's network access to it." 3
+            ;;
+        *)
+            fail "Unknown channel: ${channel}" \
+                 "Expected stable, patches, beta or rc." \
+                 "The retired names staging and dev are also accepted, and mean" \
+                 "patches and beta respectively." 3
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+# Clone, or leave an existing checkout alone.
+#
+# Idempotent by refusing to be clever: if there is already a .git here, this
+# script's job is done and it has no business resetting, pulling, or deleting
+# somebody's working tree. bin/updatefog.sh is the thing that moves an existing
+# checkout between channels, and it knows how to do it safely.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Is FOG already installed on this machine?
+#
+# The check below this one asks whether there is a CHECKOUT at --git-path,
+# which is a different question and was the only one being asked. A server
+# installed from a checkout somewhere else, or from a tarball, answered "no" --
+# so this cloned a second copy and ran the installer over the live server
+# without ever saying it was doing an upgrade.
+#
+# /etc/fog/fog.conf is the same pointer installfog.sh and updatefog.sh follow
+# (GH-850), so this finds what they would find.
+# ---------------------------------------------------------------------------
+existingProgramDir=""
+existingGitPath=""
+if [[ -r /etc/fog/fog.conf ]]; then
+    existingProgramDir=$(sed -n 's/^fogprogramdir=//p' /etc/fog/fog.conf 2>/dev/null | tr -d "\"' " | tail -n1)
+fi
+[[ -z $existingProgramDir ]] && [[ -r /opt/fog/.fogsettings ]] && existingProgramDir="/opt/fog"
+existingProgramDir="${existingProgramDir%/}"
+
+if [[ -n $existingProgramDir && -r ${existingProgramDir}/.fogsettings ]]; then
+    existingGitPath=$(sed -n 's/^FOG_git_path=//p' "${existingProgramDir}/.fogsettings" 2>/dev/null | tr -d "\"' " | tail -n1)
+    [[ -z $existingGitPath ]] && existingGitPath=$(sed -n 's/^fog_git_path=//p' "${existingProgramDir}/.fogsettings" 2>/dev/null | tr -d "\"' " | tail -n1)
+
+    echo " * FOG is already installed at ${existingProgramDir}."
+
+    # Hand over to the updater when there is a checkout for it to work in.
+    # That is the same job, done by the script that owns it -- and it uses the
+    # checkout this server actually installed from rather than cloning a
+    # second one somewhere else.
+    if [[ -n $existingGitPath && -x ${existingGitPath}/bin/updatefog.sh ]]; then
+        updateArgs=()
+        [[ $fromChannel -eq 1 ]] && updateArgs+=(--channel "$channel")
+        [[ -n $branch && $fromChannel -eq 0 ]] && updateArgs+=(--branch "$branch")
+        [[ -n $autoYes ]] && updateArgs+=(-y)
+        echo " | Its checkout is ${existingGitPath}, so this is an update rather"
+        echo " | than an install. Handing over to the updater:"
+        echo " |"
+        echo " |   cd ${existingGitPath}/bin && ./updatefog.sh ${updateArgs[*]}"
+        echo
+        drainStdin
+        cd "${existingGitPath}/bin" || fail "Could not enter ${existingGitPath}/bin." 6
+        exec bash ./updatefog.sh "${updateArgs[@]}"
+    fi
+
+    # Installed, but with no checkout to update from -- a tarball install, or
+    # one whose checkout has been deleted. Cloning is the right move, and the
+    # installer picks the existing server up through /etc/fog/fog.conf. Say so,
+    # because "install" and "upgrade the running server" are not the same thing
+    # to whoever typed this.
+    echo " | There is no git checkout recorded for it, so this will clone one"
+    echo " | and UPGRADE the existing server in place. Your data and settings"
+    echo " | are kept; the installer finds them through /etc/fog/fog.conf."
+    echo
+fi
+
+if [[ -d ${gitpath}/.git ]]; then
+    echo " * ${gitpath} is already a git checkout -- not cloning over it."
+    echo " | To move an existing install to another channel, use:"
+    echo " |   cd ${gitpath}/bin && ./updatefog.sh --channel ${channel}"
+    echo
+    # FETCH FIRST, and this is not optional on this path.
+    #
+    # The checkout below is the same line for a fresh clone and for a
+    # pre-existing one, and a pre-existing one may not have heard of the branch
+    # being asked for. Two ways that went wrong, both silent about the real
+    # cause:
+    #
+    #   --channel rc resolves against the REMOTE, so it can name rc-1.6.4 while
+    #   this clone has never fetched it -- the checkout then failed with
+    #   "the branch may have been renamed", which is not what happened.
+    #
+    #   A stale local `stable` checks out perfectly well and bootstrap installs
+    #   a months-old tree while reporting success, which is worse.
+    echo -n " * Fetching ${gitpath}... "
+    if git -C "$gitpath" fetch --all --prune >/dev/null 2>&1; then
+        echo "Done"
+    else
+        echo "Failed"
+        echo " | Could not fetch. Continuing with what is already in the"
+        echo " | checkout -- if the install turns out to be an old version,"
+        echo " | this is why."
+    fi
+else
+    if [[ -e $gitpath && -n $(ls -A "$gitpath" 2>/dev/null) ]]; then
+        fail "${gitpath} exists and is not empty, but is not a git checkout." \
+             "Move it aside, or choose another path with --git-path." 6
+    fi
+    # --progress explicitly, and a warning first. The repository is around
+    # 200,000 objects; the receive phase is long enough on an ordinary link
+    # that a quiet clone looks like a hang, which is what it looked like on the
+    # first real server this ran on.
+    echo " * Cloning FOG into ${gitpath}"
+    echo " | This repository is large -- roughly 200,000 objects -- so expect"
+    echo " | several minutes, and longer on a slow connection."
+    git clone --progress "$repo" "$gitpath" || fail "git clone failed." 6
+fi
+
+echo " * Checking out ${branch}"
+git -C "$gitpath" checkout "$branch" || fail "Could not check out ${branch}." \
+    "If this is a channel, the branch may have been renamed; if you passed" \
+    "--branch, check the name." 6
+
+# ---------------------------------------------------------------------------
+# Hand over to the installer.
+#
+# < /dev/tty, and this is the whole reason it is here: under
+# `curl ... | bash`, this script's stdin IS THE PIPE. Every read in
+# installfog.sh would take the remaining bytes of this file, or EOF, and answer
+# its own prompts with them. Reattaching the terminal is what makes an
+# interactive install possible at all from a one-liner.
+#
+# With no terminal and no --yes, this REFUSES rather than quietly falling back
+# to -Y. An unattended install of imaging software, as root, on a machine
+# nobody is watching, is not something to start because a tty happened to be
+# missing -- it is something to ask for.
+# ---------------------------------------------------------------------------
+# Forwarded only when a channel was actually chosen. --branch is a one-off for
+# testing a PR, exactly as it is in updatefog.sh: it must not leave the server
+# recording a channel it is not on.
+channelArgs=()
+[[ $fromChannel -eq 1 ]] && channelArgs=(--channel "$channel")
+
+if [[ -n $autoYes ]]; then
+    echo " * Starting the installer unattended"
+    (cd "${gitpath}/bin" && bash installfog.sh -Y "${channelArgs[@]}")
+    exit $?
+fi
+
+# Tested by OPENING it, not by stat'ing it. /dev/tty exists in plenty of
+# contexts where opening it fails with ENXIO -- a container started without a
+# tty is the common one -- and `[[ -r ]]` cannot tell those apart.
+if ! (exec < /dev/tty) 2>/dev/null; then
+    fail "No terminal is available, so the installer cannot run interactively." \
+         "This happens when the one-liner runs from cloud-init, CI, or a" \
+         "container with no tty attached." \
+         "" \
+         "Re-run with --yes for an unattended install:" \
+         "  curl -fsSL <url>/bootstrap.sh | bash -s -- --channel ${channel} --yes" 7
+fi
+
+echo " * Starting the installer"
+echo
+(cd "${gitpath}/bin" && bash installfog.sh "${channelArgs[@]}" < /dev/tty)
+exit $?

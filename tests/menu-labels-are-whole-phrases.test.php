@@ -2,13 +2,6 @@
 /**
  * Gate: the node sub-menu labels are whole translatable phrases.
  *
- * Ported from working-1.6, where the change was made first, and kept as close
- * to identical as the branches allow so the two do not drift. What differs:
- * the methods live in lib/fog/fogpage.class.php here, they are keyed on
- * $this->childClass rather than the node name, and this branch has eight such
- * nodes rather than thirteen -- iPXE menus, modules, roles, sites and user
- * groups have no page here.
- *
  * GH-435. `List All X` / `Create New X` used to be built by sprintf()ing a
  * translated noun into a translated format string. That cannot be translated
  * correctly in any language that inflects: `Creer un nouveau %s` is masculine,
@@ -25,9 +18,9 @@
  * running them costs nothing and is the only thing that actually goes red when
  * a case is dropped or the degradation arm is removed.
  *
- * The wiring cannot be executed the same way (it is inline in a constructor
- * that needs self::$foglang and a booted class), so it is anchored as source:
- * the call AND the guard that keeps the composed fallback reachable.
+ * The wiring in _buildSubMenuItems() cannot be executed the same way (it needs
+ * self::$foglang and a booted class), so it is anchored as source: both the
+ * call AND the guard that keeps the composed fallback reachable for plugins.
  * Anchoring the guard as well as the call is deliberate -- a change that keeps
  * the call but drops `if (!count($menu))` would silently take the fallback out
  * from under every plugin node.
@@ -37,7 +30,7 @@
  */
 
 $root = dirname(__DIR__);
-$src = $root . '/packages/web/lib/fog/fogpage.class.php';
+$src = $root . '/packages/web/src/Base/FOGPage.php';
 $fails = [];
 
 $text = file_get_contents($src);
@@ -128,10 +121,12 @@ eval('class MenuProbe { ' . $lifted . '
  * node dropped from the switch silently goes back to the composed form.
  */
 $nodes = [
-    'Group' => 'Group', 'Host' => 'Host', 'Image' => 'Image',
-    'Printer' => 'Printer', 'Snapin' => 'Snapin',
-    'StorageGroup' => 'Storage Group', 'StorageNode' => 'Storage Node',
-    'User' => 'User',
+    'group' => 'Group', 'host' => 'Host', 'image' => 'Image',
+    'ipxe' => 'Ipxe Menu', 'module' => 'Module', 'printer' => 'Printer',
+    'role' => 'Role', 'site' => 'Site', 'snapin' => 'Snapin',
+    'software' => 'Software',
+    'storagegroup' => 'Storage Group', 'storagenode' => 'Storage Node',
+    'user' => 'User', 'usergroup' => 'User Group',
 ];
 
 $msgids = [];
@@ -160,7 +155,7 @@ foreach ($nodes as $node => $noun) {
  * plugin's node name is not knowable from core, and a plugin ships its own
  * catalog. A `default:` arm added to the switch would break every one of them.
  */
-if ([] !== MenuProbe::strings('HelloWorld')) {
+if ([] !== MenuProbe::strings('helloworld')) {
     $fails[] = 'unknown node did not fall through to the composed form';
 }
 
@@ -213,24 +208,21 @@ if (false === strpos($compose, "return '' === (string)\$out ? (string)\$value : 
 }
 
 /*
- * The wiring. On this branch the menu is built inline in __construct() rather
- * than in a method of its own, so there is nothing to lift and execute --
- * anchoring on the enclosing method name would mean brace-matching 250 lines
- * of constructor, including closures. The block itself is anchored instead,
- * whole: the call to the switch, the guard that keeps the composed fallback
- * reachable for plugins, and the safe compose. Anchoring the block rather
- * than the names is what makes gutting it go red.
+ * The wiring. _buildSubMenuItems() must call the switch AND must keep the
+ * composed fallback reachable behind an emptiness guard.
  */
-$wiring = [
-    '$pair = self::_nodeMenuStrings($this->childClass);' => 'no longer calls _nodeMenuStrings()',
-    'if (!count($pair)) {' => 'lost the fallback guard for plugin nodes',
-    'self::_composeMenuLabel(' => 'no longer composes safely for plugin nodes',
-    "'list' => \$pair['list']," => 'no longer takes its list label from the pair',
-    "'add' => \$pair['add']," => 'no longer takes its add label from the pair',
-];
-foreach ($wiring as $needle => $why) {
-    if (false === strpos($text, $needle)) {
-        $fails[] = 'fogpage.class.php ' . $why;
+$build = liftMethod($text, '_buildSubMenuItems');
+if ('' === $build) {
+    $fails[] = 'FOGPage::_buildSubMenuItems() not found';
+} else {
+    if (false === strpos($build, '_nodeMenuStrings(')) {
+        $fails[] = '_buildSubMenuItems() no longer calls _nodeMenuStrings()';
+    }
+    if (false === strpos($build, 'if (!count($menu))')) {
+        $fails[] = '_buildSubMenuItems() lost the fallback guard for plugin nodes';
+    }
+    if (false === strpos($build, '_composeMenuLabel(')) {
+        $fails[] = '_buildSubMenuItems() no longer composes safely for plugin nodes';
     }
 }
 
@@ -307,46 +299,25 @@ foreach ($catalogs as $po) {
 }
 
 /*
- * The CONFIRMED translations these msgids had before GH-435 -- live,
- * non-empty and NOT `#, fuzzy`. A fuzzy entry is msgmerge's guess, excluded
- * from the compiled .mo and so never seen by anyone; the migration composes
- * over those deliberately. These are different: a person wrote them, and
- * nothing in this change -- not the reconstruction, not the hand-written
- * French and Spanish tables -- is allowed to overwrite one. fr_FR's
- * "Créer un nouveau Snapin" is the case that proves it: the French table
- * would otherwise have changed nothing but its capital S.
+ * The only two CONFIRMED translations these msgids had before GH-435. Every
+ * other `Create New X` entry in every catalog was `#, fuzzy` -- msgmerge's
+ * guess, excluded from the compiled .mo, never seen by anyone, and frequently
+ * nonsense (de_DE offered "Neuen Drucker erstellen", Create New PRINTER, for
+ * `Create New Storage Node`). The migration composes over fuzzy entries for
+ * that reason, and these two are what it must NOT touch: they are a person's
+ * work, and they read better than anything composition produces -- no space
+ * around the noun, which is correct Japanese.
  */
 $confirmed = [
-    'fr_FR' => [
-        'Create New Printer' => 'Créer une nouvelle imprimante',
-        'Create New Snapin' => 'Créer un nouveau Snapin',
-    ],
-    'it_IT' => [
-        'Create New Printer' => 'Crea nuova stampante',
-        'Create New Snapin' => 'Crea nuovo snapin',
-    ],
-    'ja_JP' => [
-        'Create New Printer' => '新しいプリンターを作成',
-        'Create New Snapin' => '新しいスナップインを作成',
-    ],
-    'pt_BR' => [
-        'Create New Printer' => 'Criar Nova Impressora',
-        'Create New Snapin' => 'Criar Novo Snapin',
-    ],
-    'zh_CN' => [
-        'Create New Printer' => '新建打印机',
-        'Create New Snapin' => '新建插件',
-    ],
+    'Create New Printer' => '新しいプリンターを作成',
+    'Create New Snapin' => '新しいスナップインを作成',
 ];
-foreach ($confirmed as $locale => $pairs) {
-    $path = $root . '/packages/web/management/languages/' . $locale
-        . '.UTF-8/LC_MESSAGES/messages.po';
-    $body = (string)file_get_contents($path);
-    foreach ($pairs as $msgid => $msgstr) {
-        $want = 'msgid "' . $msgid . '"' . "\n" . 'msgstr "' . $msgstr . '"';
-        if (false === strpos($body, $want)) {
-            $fails[] = "$locale lost its confirmed translation of '$msgid'";
-        }
+$ja = $root . '/packages/web/management/languages/ja_JP.UTF-8/LC_MESSAGES/messages.po';
+$jaText = file_get_contents($ja);
+foreach ($confirmed as $msgid => $msgstr) {
+    $want = 'msgid "' . $msgid . '"' . "\n" . 'msgstr "' . $msgstr . '"';
+    if (false === strpos((string)$jaText, $want)) {
+        $fails[] = "ja_JP lost its confirmed translation of '$msgid'";
     }
 }
 

@@ -10,6 +10,11 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Audit\Audit;
+use FOG\Base\FOGCore;
+use FOG\Items\User;
+
 /**
  * Checks credentials for init based calls
  *
@@ -19,6 +24,15 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
 
 $remoteIP = filter_input(INPUT_SERVER, 'REMOTE_ADDR');
@@ -60,7 +74,8 @@ $clearAttempts = function () use ($lockoutFile) {
 
 $attemptData = $getAttemptData();
 $timeDiff = time() - ($attemptData['timestamp'] ?? time());
-$isLocked = ($attemptData['attempts'] ?? 0) >= 5 && $timeDiff < $lockoutDuration;
+$isLocked = ($attemptData['attempts'] ?? 0) >= $maxAttempts
+    && $timeDiff < $lockoutDuration;
 
 /**
  * 200 with the '#!rl' body, not a 429.
@@ -69,7 +84,8 @@ $isLocked = ($attemptData['attempts'] ?? 0) >= 5 && $timeDiff < $lockoutDuration
  * the whole vocabulary, and the rate-limit case was the only one that also
  * moved the status code. FOS reads it with `curl -Lks` and matches on the
  * body, so the 429 bought nothing there and would have cost the body
- * outright under a fetcher that treats 4xx as "no output".
+ * outright under a fetcher that treats 4xx as "no output" -- the same shape
+ * as the client-protocol regression fixed in dc393ade0.
  *
  * Nothing else calls this endpoint, and nothing keys on the status.
  *
@@ -91,8 +107,6 @@ if ($isLocked) {
  *
  * POST is preferred over GET to match what $_REQUEST resolved to under
  * PHP's default request_order of "GP", where POST overwrites GET.
- *
- * Refs https://github.com/FOGProject/fogproject/issues/890
  */
 $readParam = function ($name) {
     $value = filter_input(INPUT_POST, $name)
@@ -104,11 +118,11 @@ $readParam = function ($name) {
 try {
     /*
      * Through FOGBase::decodeCredential(), which is this decode lifted out so
-     * Registration::_fullReg() can share it. The two validate the SAME
+     * Registration::_deployHost() can share it. The two validate the SAME
      * credential for the SAME caller, and them disagreeing was the bug:
-     * _fullReg() ran the value through stripAndDecode(), whose closing
-     * Initiator::e() HTML-escapes it, so this endpoint answered '#!ok' for a
-     * password that registration then rejected as "Invalid Login".
+     * _deployHost() ran the value through stripAndDecode(), whose closing
+     * \Initiator::e() HTML-escapes it, so this endpoint answered '#!ok' for a
+     * password registration then rejected as "Invalid Login".
      * Forums topic 18228.
      *
      * The false-is-not-base64 arm is kept exactly as it was, throwing before
@@ -117,21 +131,40 @@ try {
      */
     $username = FOGCore::decodeCredential($readParam('username'));
     if (false === $username) {
-        throw new Exception('#!il');
+        throw new \Exception('#!il');
     }
     $password = FOGCore::decodeCredential($readParam('password'));
     if (false === $password) {
-        throw new Exception('#!il');
+        throw new \Exception('#!il');
     }
-    $userTest = FOGCore::getClass('User')
+    $userTest = (new User())
         ->passwordValidate($username, $password);
     if (!$userTest) {
         $recordBadAttempt();
-        throw new Exception('#!il');
+        throw new \Exception('#!il');
     }
     $clearAttempts();
+    // A credential proved with no session behind it. passwordValidate()
+    // records the refusals, including this endpoint's, but it cannot record
+    // the acceptances: it is also the funnel for the web login form, where
+    // establishSession() is what says a login happened. Here nothing
+    // establishes anything, so this is the only place the success exists.
+    //
+    // ADR 0021 Context 1 counts this endpoint as one of the four login paths
+    // FOG's own login files never covered.
+    Audit::record(
+        [
+            'type' => Audit::LOGIN,
+            'outcome' => Audit::ALLOWED,
+            'subjectType' => 'user',
+            'subjectLabel' => $username,
+            'createdBy' => $username,
+            'authSource' => 'ipxe',
+            'renderable' => 1
+        ]
+    );
     echo '#!ok';
-} catch (Exception $e) {
+} catch (\Exception $e) {
     if ($e->getMessage() !== '#!il') {
         $recordBadAttempt();
     }

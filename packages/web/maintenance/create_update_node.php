@@ -10,6 +10,12 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Items\StorageNode;
+use FOG\Managers\StorageNodeManager;
+use FOG\Router\Route;
+
 /**
  * Creates or updates nodes.
  *
@@ -23,10 +29,8 @@
  */
 require '../commons/base.inc.php';
 
-// Restrict to same-machine requests only. This creates and updates storage
-// nodes -- including their credentials -- and the fogverified check below is
-// a sentinel the installer sends, not a secret, so on its own it stops
-// nothing. The installer always posts from the server's own IP.
+// Restrict to same-machine requests only — installer always calls via the
+// server's own IP address, never from a remote host.
 $_remoteIp = $_SERVER['REMOTE_ADDR'] ?? '';
 $_serverIp = $_SERVER['SERVER_ADDR'] ?? '';
 if ($_remoteIp !== '127.0.0.1'
@@ -38,51 +42,111 @@ if ($_remoteIp !== '127.0.0.1'
 }
 unset($_remoteIp, $_serverIp);
 
+// Require the fogverified sentinel before doing any work.
+if (!isset($_POST['fogverified'])) {
+    exit;
+}
+
 foreach ((array)$_POST as $key => &$val) {
     if (!isset($val)) {
         continue;
     }
-    $_POST[$key] = trim(
-        base64_decode($val)
+    $stripped[$key] = trim(
+        base64_decode((string)filter_input(INPUT_POST, $key))
     );
     unset($val);
 }
-if (!isset($_POST['fogverified'])) {
-    return;
+/**
+ * Decides what a self-registering node is called in Storage Management.
+ *
+ * The posted name used to be discarded outright -- this file did
+ * `$name = $ip = $stripped['ip']`, so the installer's `name=` field had no
+ * effect and every node was called after its own address. That is the reason a
+ * storage node could not be issued a certificate: nodecert.php builds the SAN
+ * from this record, and a Name that is an IP literal produces "DNS:10.0.0.5",
+ * which matches no DNS subtree in the Web CA's name constraints.
+ *
+ * The address stays the fallback, so a node that offers nothing usable ends up
+ * exactly where it used to be rather than unregistered.
+ *
+ * ngmMemberName is UNIQUE (schema step 1551) and FOGController::save() inserts
+ * with ON DUPLICATE KEY UPDATE, so accepting a name another node already holds
+ * would not fail -- it would quietly rewrite that node's row with this one's
+ * address and paths. Hostnames are not unique across a fleet the way addresses
+ * are (two default RHEL installs are both `localhost.localdomain`), so the name
+ * is checked for a collision before it is taken, not assumed to be free.
+ *
+ * @param string $posted Name the node asked to be registered under.
+ * @param string $ip     The node's address, used when the name is unusable.
+ *
+ * @return string
+ */
+function nodeRegistrationName($posted, $ip)
+{
+    $posted = trim((string) $posted);
+    if ($posted === ''
+        || filter_var($posted, FILTER_VALIDATE_IP)
+        || !filter_var($posted, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME)
+        || preg_match('/^localhost(\..*)?$/i', $posted)
+    ) {
+        return $ip;
+    }
+    if ((new StorageNodeManager())->exists($posted, 0, 'name')) {
+        return $ip;
+    }
+    return $posted;
 }
+
+$ip = $stripped['ip'] ?? '';
+$user = $stripped['user'] ?? '';
+$pass = $stripped['pass'] ?? '';
 if (isset($_POST['newNode'])) {
-    $exists = FOGCore::getClass('StorageNodeManager')
-        ->exists($_POST['ip'], '', 'ip');
+    $name = nodeRegistrationName($stripped['name'] ?? '', $ip);
+    $path       = $stripped['path'] ?? '';
+    $ftppath    = $stripped['ftppath'] ?? '';
+    $sslpath    = $stripped['sslpath'] ?? '';
+    $snapinpath = $stripped['snapinpath'] ?? '';
+    $maxClients = $stripped['maxClients'] ?? 10;
+    $interface  = $stripped['interface'] ?? '';
+    $bandwidth  = $stripped['bandwidth'] ?? 1;
+    $webroot    = $stripped['webroot'] ?? '/';
+    $exists = (new StorageNodeManager())
+        ->exists($ip, '', 'ip');
     if ($exists) {
         return;
     }
-    FOGCore::getClass('StorageNode')
-        ->set('name', trim($_POST['name']))
-        ->set('path', trim($_POST['path']))
-        ->set('ftppath', trim($_POST['ftppath']))
-        ->set('snapinpath', trim($_POST['snapinpath']))
-        ->set('sslpath', trim($_POST['sslpath']))
-        ->set('ip', trim($_POST['ip']))
-        ->set('maxClients', trim($_POST['maxClients']))
-        ->set('user', trim($_POST['user']))
-        ->set('pass', trim($_POST['pass']))
-        ->set('interface', trim($_POST['interface']))
-        ->set('bandwidth', trim($_POST['bandwidth']))
-        ->set('webroot', trim($_POST['webroot']))
+    (new StorageNode())
+        ->set('name', $name)
+        ->set('path', $path)
+        ->set('ftppath', $ftppath)
+        ->set('snapinpath', $snapinpath)
+        ->set('sslpath', $sslpath)
+        ->set('ip', $ip)
+        ->set('maxClients', $maxClients)
+        ->set('user', $user)
+        ->set('pass', $pass)
+        ->set('interface', $interface)
+        ->set('bandwidth', $bandwidth)
+        ->set('webroot', $webroot)
         ->set('isEnabled', '1')
         ->save();
 } elseif (isset($_POST['nodePass'])) {
-    foreach ((array)FOGCore::getClass('StorageNodeManager')
-        ->find(array('ip' => $_POST['ip'])) as &$Node
-    ) {
-        if (($Node->get('pass') === trim($_POST['pass'])) &&
-            ($Node->get('user') === trim($_POST['user']))) {
+    // $ip, $user, $pass are already base64_decoded via the $stripped loop above.
+    // Do NOT call base64_decode() again here.
+    $StorageNodes = Route::getList(
+        'storagenode',
+        ['ip' => $ip]
+    );
+    foreach ($StorageNodes as &$StorageNode) {
+        if ($StorageNode->user === trim($user)
+            && $StorageNode->pass === trim($pass)
+        ) {
             continue;
         }
-        $Node
-            ->set('pass', trim($_POST['pass']))
-            ->set('user', trim($_POST['user']))
+        (new StorageNode($StorageNode->id))
+            ->set('user', $user)
+            ->set('pass', $pass)
             ->save();
-        unset($Node);
+        unset($StorageNode);
     }
 }

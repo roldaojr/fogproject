@@ -2,22 +2,23 @@
 /**
  * A credential must reach passwordValidate() as the operator typed it.
  *
- * Registration::_fullReg() used to read username and password out of the array
- * FOGBase::stripAndDecode() had rewritten. That helper closes with
- * Initiator::e() -- htmlspecialchars(ENT_QUOTES) -- which is right for a value
- * about to be rendered into a page and wrong for one about to be compared
- * against a password hash. A password containing & < > " or ' arrived at
- * password_verify() as its entity form and could never match, so the account
- * could not register-with-deploy while signing in perfectly from the web UI
- * and answering '#!ok' at service/checkcredentials.php -- which is exactly the
- * contradiction reported in forums topic 18228.
+ * Registration::_deployHost() used to read username and password out of the
+ * array FOGBase::stripAndDecode() had rewritten. stripAndDecodeItem() closes
+ * with \Initiator::e() -- htmlspecialchars(ENT_QUOTES) -- which is right for a
+ * value about to be rendered into a page and wrong for one about to be
+ * compared against a password hash. A password containing & < > " or ' arrived
+ * at password_verify() as its entity form and could never match, so the
+ * account could not register-with-deploy while signing in perfectly from the
+ * web UI and answering '#!ok' at service/checkcredentials.php -- which is
+ * exactly the contradiction reported in forums topic 18228.
  *
  * MOST OF THIS IS EXECUTED, NOT SCANNED. decodeCredential() is called for real
  * with the values FOS actually sends, so a gutted implementation goes red.
- * Only the two read SITES have to be pinned by source: whether _fullReg() reads
- * the mangled array or the raw request is a fact about one line inside a method
- * that needs a whole HTTP request to reach, and the end-to-end proof of that
- * lives in scripts/background_scripts/prove_registration_deploy_login_18228.sh.
+ * Only the two read SITES have to be pinned by source: whether _deployHost()
+ * reads the mangled array or the raw request is a fact about one line inside a
+ * method that needs a whole HTTP request to reach, and the end-to-end proof of
+ * that lives in
+ * scripts/background_scripts/prove_registration_deploy_login_18228_16.sh.
  *
  * No database.
  *
@@ -25,26 +26,45 @@
  * Exit status 0 = pass, 1 = fail.
  */
 
-$root = dirname(__DIR__);
-$web = $root . '/packages/web';
+$webroot = dirname(__DIR__) . '/packages/web';
+$init = $webroot . '/commons/init.php';
+if (!is_readable($init)) {
+    fwrite(STDERR, "FAIL: cannot read $init\n");
+    exit(1);
+}
 
-require $web . '/commons/init.php';
+$tmp = sys_get_temp_dir() . '/fog-cred-escape-test-' . getmypid();
+@mkdir($tmp . '/cache', 0700, true);
+@mkdir($tmp . '/log', 0700, true);
+register_shutdown_function(
+    function () use ($tmp) {
+        if (!is_dir($tmp)) {
+            return;
+        }
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($tmp, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+        foreach ($it as $f) {
+            $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname());
+        }
+        @rmdir($tmp);
+    }
+);
+if (!defined('FOG_CACHE_DIR')) {
+    define('FOG_CACHE_DIR', $tmp . '/cache');
+}
+if (!defined('FOG_LOG_DIR')) {
+    define('FOG_LOG_DIR', $tmp . '/log');
+}
+if (!defined('FOG_PLUGIN_DIR')) {
+    define('FOG_PLUGIN_DIR', $tmp . '/plugins');
+}
+
+require_once $init;
 new Initiator();
 
-$fails = array();
-
-/**
- * Records a failed assertion.
- *
- * @param array  $fails collected failures
- * @param string $why   what did not hold
- *
- * @return void
- */
-function credFail(array &$fails, $why)
-{
-    $fails[] = $why;
-}
+$fails = [];
 
 /**
  * Reads a file with its comments stripped.
@@ -60,9 +80,9 @@ function credFail(array &$fails, $why)
 function credCode($path)
 {
     $out = '';
-    foreach (token_get_all(file_get_contents($path)) as $token) {
+    foreach (token_get_all((string) file_get_contents($path)) as $token) {
         if (is_array($token)) {
-            if (in_array($token[0], array(T_COMMENT, T_DOC_COMMENT), true)) {
+            if (in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true)) {
                 continue;
             }
             $out .= $token[1];
@@ -74,8 +94,8 @@ function credCode($path)
     return $out;
 }
 
-$regPath = $web . '/lib/reg-task/registration.class.php';
-$ccPath = $web . '/service/checkcredentials.php';
+$regPath = $webroot . '/src/Boot/Registration.php';
+$ccPath = $webroot . '/service/checkcredentials.php';
 $reg = credCode($regPath);
 $cc = credCode($ccPath);
 
@@ -85,16 +105,16 @@ $cc = credCode($ccPath);
  * the absent-checks would all pass and this suite would report green on a
  * deleted feature.
  */
-if (strlen($reg) < 8000) {
-    credFail($fails, 'registration.class.php read as only ' . strlen($reg) . ' bytes of code');
+if (strlen($reg) < 9000) {
+    $fails[] = 'registration.class.php read as only ' . strlen($reg) . ' bytes of code';
 }
-if (strlen($cc) < 1500) {
-    credFail($fails, 'checkcredentials.php read as only ' . strlen($cc) . ' bytes of code');
+if (strlen($cc) < 2500) {
+    $fails[] = 'checkcredentials.php read as only ' . strlen($cc) . ' bytes of code';
 }
 
 // ---- 1. decodeCredential() itself, executed --------------------------------
 
-$cases = array(
+$cases = [
     'plain alphanumeric' => 'Passw0rd',
     'an ampersand' => 'f&g-Pass1',
     'an apostrophe' => "it's-fog1",
@@ -105,18 +125,15 @@ $cases = array(
     // thread reported a French keyboard and this is what rules that out as
     // the cause.
     'an accented character' => 'motdepasse' . chr(0xC3) . chr(0xA9),
-);
+];
 foreach ($cases as $label => $plain) {
-    $seen = FOGBase::decodeCredential(base64_encode($plain));
+    $seen = \FOG\Base\FOGBase::decodeCredential(base64_encode($plain));
     if ($seen !== $plain) {
-        credFail(
-            $fails,
-            sprintf(
-                'decodeCredential() mangled a password containing %s: sent %s, got %s',
-                $label,
-                var_export($plain, true),
-                var_export($seen, true)
-            )
+        $fails[] = sprintf(
+            'decodeCredential() mangled a password containing %s: sent %s, got %s',
+            $label,
+            var_export($plain, true),
+            var_export($seen, true)
         );
     }
 }
@@ -128,14 +145,11 @@ foreach ($cases as $label => $plain) {
  * turns a mangled login into a REFUSED one, which is a worse regression than
  * the bug being fixed. 'fg>aaP1' encodes to 'Zmc+YWFQMQ=='.
  */
-if (FOGBase::decodeCredential('Zmc+YWFQMQ==') !== 'fg>aaP1') {
-    credFail($fails, "decodeCredential() failed on base64 containing a '+'");
+if (\FOG\Base\FOGBase::decodeCredential('Zmc+YWFQMQ==') !== 'fg>aaP1') {
+    $fails[] = "decodeCredential() failed on base64 containing a '+'";
 }
-if (FOGBase::decodeCredential('Zmc YWFQMQ==') !== 'fg>aaP1') {
-    credFail(
-        $fails,
-        "decodeCredential() did not restore a '+' that arrived as a space"
-    );
+if (\FOG\Base\FOGBase::decodeCredential('Zmc YWFQMQ==') !== 'fg>aaP1') {
+    $fails[] = "decodeCredential() did not restore a '+' that arrived as a space";
 }
 
 /*
@@ -143,33 +157,25 @@ if (FOGBase::decodeCredential('Zmc YWFQMQ==') !== 'fg>aaP1') {
  * character outside the alphabet and always "succeeds", so a corrupted field
  * became a plausible wrong credential rather than a refused one.
  */
-foreach (array('not!valid!base64!', '@@@@', "Zm9n\x00YQ==") as $junk) {
-    if (false !== FOGBase::decodeCredential($junk)) {
-        credFail(
-            $fails,
-            'decodeCredential() accepted ' . var_export($junk, true)
-                . ' instead of refusing it -- the decode is not strict'
-        );
+foreach (['not!valid!base64!', '@@@@', "Zm9n\x00YQ=="] as $junk) {
+    if (false !== \FOG\Base\FOGBase::decodeCredential($junk)) {
+        $fails[] = 'decodeCredential() accepted ' . var_export($junk, true)
+            . ' instead of refusing it -- the decode is not strict';
     }
 }
 
 // ---- 2. the helper it must NOT be, still escaping ---------------------------
 
 /*
- * The fix must not be "make stripAndDecode() stop escaping". That helper feeds
- * values that ARE rendered into pages, so weakening it to fix a login would
- * trade an authentication bug for an injection one. Asserted positively: the
- * escaping is still there, and decodeCredential() is a genuinely different
+ * The fix must not be "make stripAndDecodeItem() stop escaping". That helper
+ * feeds values that ARE rendered into pages, so weakening it to fix a login
+ * would trade an authentication bug for an injection one. Asserted positively:
+ * the escaping is still there, and decodeCredential() is a genuinely different
  * path rather than an alias for it.
  */
-$item = array('v' => base64_encode('a<b&c'));
-$stripped = FOGBase::stripAndDecode($item);
-if (false === strpos($stripped['v'], '&lt;')) {
-    credFail(
-        $fails,
-        'stripAndDecode() no longer HTML-escapes -- the credential fix must not '
-        . 'have been made by weakening the shared sanitiser'
-    );
+if (false === strpos(\FOG\Base\FOGBase::stripAndDecodeItem(base64_encode('a<b&c')), '&lt;')) {
+    $fails[] = 'stripAndDecodeItem() no longer HTML-escapes -- the credential fix'
+        . ' must not have been made by weakening the shared sanitiser';
 }
 
 // ---- 3. the read sites ------------------------------------------------------
@@ -177,37 +183,34 @@ if (false === strpos($stripped['v'], '&lt;')) {
 /*
  * The whole read is anchored, not just the function name. A grep for
  * "decodeCredential" alone passes on a line whose result is thrown away, and
- * a grep for the closure alone passes if someone re-reads $_REQUEST after it.
+ * a grep for the closure alone passes if someone re-reads $_POST after it.
  */
 $readSite = "\$readCred = function (\$name) {\n"
-    . "                return filter_input(INPUT_POST, \$name)\n"
-    . "                    ?? filter_input(INPUT_GET, \$name)\n"
-    . "                    ?? '';\n"
-    . "            };\n"
-    . "            \$username = self::decodeCredential(\$readCred('username'));\n"
-    . "            \$password = self::decodeCredential(\$readCred('password'));";
+    . "            return filter_input(INPUT_POST, \$name)\n"
+    . "                ?? filter_input(INPUT_GET, \$name)\n"
+    . "                ?? '';\n"
+    . "        };\n"
+    . "        \$username = self::decodeCredential(\$readCred('username'));\n"
+    . "        \$password = self::decodeCredential(\$readCred('password'));";
 if (false === strpos($reg, $readSite)) {
-    credFail(
-        $fails,
-        '_fullReg() no longer reads its credentials through decodeCredential() '
-        . 'on the raw request'
-    );
+    $fails[] = '_deployHost() no longer reads its credentials through'
+        . ' decodeCredential() on the raw request';
 }
 
 /*
  * filter_input() reads PHP's ORIGINAL request data, so it is immune to
- * stripAndDecode() rewriting the superglobal in place. Reading the superglobal
- * would reintroduce the bug the moment someone moved the stripAndDecode()
- * call, which is precisely how the first cut of this fix broke working-1.6.
+ * stripAndDecode() rewriting the superglobal in place. _fullReg() calls
+ * stripAndDecode($_POST) BEFORE it calls _deployHost(), so reading the
+ * superglobal there reads the already-escaped copy -- which is not a
+ * hypothetical: the first cut of this fix did exactly that and rejected every
+ * login until the end-to-end proof caught it.
  */
-foreach (array('$_REQUEST[\'username\']', '$_REQUEST[\'password\']',
-               '$_POST[\'username\']', '$_POST[\'password\']') as $bad) {
+foreach (["\$stripped['username']", "\$stripped['password']",
+          "\$_POST['username']", "\$_POST['password']",
+          "\$_REQUEST['username']", "\$_REQUEST['password']"] as $bad) {
     if (false !== strpos($reg, $bad)) {
-        credFail(
-            $fails,
-            'registration reads ' . $bad . ' -- credentials must come from '
-            . 'filter_input(), not the superglobal stripAndDecode() rewrites'
-        );
+        $fails[] = 'registration reads ' . $bad . ' -- credentials must come from'
+            . ' filter_input(), not an array stripAndDecode() has rewritten';
     }
 }
 
@@ -220,18 +223,12 @@ foreach (array('$_REQUEST[\'username\']', '$_REQUEST[\'password\']',
 if (false === strpos($cc, "FOGCore::decodeCredential(\$readParam('username'))")
     || false === strpos($cc, "FOGCore::decodeCredential(\$readParam('password'))")
 ) {
-    credFail(
-        $fails,
-        'checkcredentials.php no longer decodes through the shared '
-        . 'decodeCredential(), so it can drift from registration again'
-    );
+    $fails[] = 'checkcredentials.php no longer decodes through the shared'
+        . ' decodeCredential(), so it can drift from registration again';
 }
 if (false !== strpos($cc, 'base64_decode(')) {
-    credFail(
-        $fails,
-        'checkcredentials.php decodes base64 itself again instead of sharing '
-        . 'decodeCredential()'
-    );
+    $fails[] = 'checkcredentials.php decodes base64 itself again instead of'
+        . ' sharing decodeCredential()';
 }
 
 // ---- report -----------------------------------------------------------------

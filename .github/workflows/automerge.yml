@@ -1,0 +1,185 @@
+name: Auto-merge
+
+# Arms GitHub's auto-merge on a pull request as soon as it is opened, so that
+# nobody has to come back and press a button when the checks eventually go
+# green.
+#
+# WHY THIS EXISTS
+#
+# The `working-1.6 pull request gate` ruleset sets the merge method to the
+# MERGE QUEUE. That makes merging two steps rather than one: the checks going
+# green is only the precondition, and something still has to ASK for the merge
+# before anything is enqueued. A pull request with all nine checks passing,
+# reading CLEAN and MERGEABLE, sits open forever if nobody asks -- which is
+# exactly what it did, repeatedly, and it looks identical to being stuck.
+#
+# Auto-merge is the platform's own answer: armed once, GitHub enqueues the
+# pull request itself the moment the required checks pass. Arming it at OPEN
+# rather than at green is the whole point -- it is a decision made at a moment
+# someone is already looking at the pull request, instead of an interruption
+# later.
+#
+# WHAT THIS CHANGES, STATED PLAINLY
+#
+# A non-draft pull request against working-1.6 from this repository will now
+# MERGE ITSELF once its checks pass. That is a real policy change and it is
+# the intended one, but it means "open a pull request" now means "merge this
+# when it is green".
+#
+# To hold one back, open it as a DRAFT. That is the opt-out, and it is the
+# meaning drafts already carry, so there is no second mechanism to remember.
+# Marking it ready for review arms auto-merge at that point instead.
+#
+# Auto-merge is not a bypass. Every required check must still pass, the branch
+# must still be up to date, and the merge queue still runs its own checks
+# against the merge-group ref afterwards. This changes WHO presses the button,
+# not what the button is allowed to do. Disabling it on a single pull request
+# is one click in the UI, or `gh pr merge <n> --disable-auto`.
+
+on:
+  pull_request:
+    # `opened` is the normal path. `ready_for_review` covers the draft
+    # opt-out being lifted, and is NOT one of the default activity types --
+    # without naming it here, taking a pull request out of draft would arm
+    # nothing and the button would be back.
+    #
+    # Deliberately NOT `synchronize`: re-arming on every push is pointless
+    # work, since auto-merge survives a push, and it would fight anyone who
+    # had deliberately turned it off.
+    types: [opened, ready_for_review]
+
+# Least privilege, stated rather than inherited -- the same reasoning the
+# regen job gives in tests.yml.
+#
+# `contents: write` is REQUIRED and was established from a failing run, not
+# from the docs. With `contents: read` and `pull-requests: write` the
+# mutation answers:
+#
+#     GraphQL: Resource not accessible by integration
+#     (enablePullRequestAutoMerge)
+#
+# Auto-merge is a merge the platform performs later, so it is gated on
+# contents write rather than on pull-request write alone, however much it
+# reads like a pull-request property.
+#
+# This is not an escalation in practice. A `pull_request` token is read-only
+# for forks whatever is asked for here, and the job is guarded to same-repo
+# pull requests anyway -- so the only people who can reach it are people who
+# already have push access.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  arm:
+    name: arm auto-merge
+    # Same shape of guard as tests.yml's regen job, and for the same reasons.
+    #
+    # Same-repo: a fork's GITHUB_TOKEN is read-only, so this could not arm
+    # anything anyway, and a fork pull request is one whose merge is a
+    # maintainer's decision rather than an automatic one.
+    #
+    # Base allowlist: dev-branch is the branch whose ruleset carries the merge
+    # queue (it took over working-1.6's at the 1.6.0 release). stable is not in
+    # scope and must not start merging itself as a side effect of this file.
+    #
+    # Head denylist: workflows for a `pull_request` are read from the merge of
+    # head into base, so a pull request whose HEAD is a long-lived branch runs
+    # this file too. stable-releases.yml opens exactly such a pull request to
+    # sync a release back, and those are not merge-on-green material.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.base.ref == 'dev-branch'
+      && !github.event.pull_request.draft
+      && !contains(fromJson('["stable", "master", "dev-branch", "working-1.6"]'), github.event.pull_request.head.ref)
+
+    runs-on: ubuntu-latest
+
+    steps:
+      # THE APP TOKEN IS LOAD BEARING. This job does not work with
+      # secrets.GITHUB_TOKEN, and its failure mode is the worst kind: nothing
+      # errors, and the pull request never merges.
+      #
+      # GitHub will not start a workflow run from an event caused by
+      # GITHUB_TOKEN. That is the platform's anti-recursion rule and it is
+      # deliberate -- without it, a workflow that pushes a commit would
+      # trigger itself forever.
+      #
+      # Arming auto-merge makes GitHub enqueue the pull request later, and the
+      # enqueue is attributed to whoever armed it. Armed with GITHUB_TOKEN, the
+      # `merge_group` event that enqueue raises therefore starts NOTHING. The
+      # queue branch is created, tests.yml never runs against it, none of the
+      # required contexts is ever reported, and the entry sits in
+      # AWAITING_CHECKS until the ruleset's check_response_timeout_minutes (60)
+      # ejects it. Waiting cannot help: there is nothing left to arrive.
+      #
+      # OBSERVED, not deduced. On 2026-08-30, #1519, #1520 and #1521 were
+      # enqueued by hand and dispatched within seconds; #1522 and #1523 were
+      # enqueued by github-actions[bot] through this job and never dispatched
+      # at all -- zero workflow runs and zero check runs on the queue commit.
+      # Dequeuing #1522 and re-arming it as a human dispatched it in six
+      # seconds. The only variable was who did the enqueuing.
+      #
+      # An App token is not subject to the rule, which is why the regen job in
+      # tests.yml already mints one to push its commit. Same App, same org
+      # variable and secret; tests.yml passes `secrets: inherit`, which is what
+      # makes FOG_WORKFLOWS_PRIVATE_KEY resolvable here.
+      #
+      # A fork pull request has no secrets, so this step cannot mint anything
+      # there. That is already handled by the same-repo guard on the job.
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ vars.FOG_WORKFLOWS_APPID }}
+          private-key: ${{ secrets.FOG_WORKFLOWS_PRIVATE_KEY }}
+          owner: FOGProject
+          repositories: "fogproject"
+
+      # Arm only behind a gate. Auto-merge merges as soon as every REQUIRED
+      # check passes, so on a base with no required checks it merges the
+      # moment the pull request opens, with its tests still queued. That
+      # happened at the 1.6.0 cut: the base allowlist moved to dev-branch one
+      # step before the ruleset did, and #2031 and #2033 merged with no CI.
+      # Read the rules GitHub actually enforces on the base, rather than
+      # trusting that the ruleset and this file were moved together. Fails
+      # loudly (see below for why) and leaves the merge to a person.
+      - name: Refuse to arm without required checks
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          n=$(gh api "repos/${{ github.repository }}/rules/branches/$BASE" \
+            --jq '[.[] | select(.type == "required_status_checks")
+                   | .parameters.required_status_checks[]] | length')
+          if [ "${n:-0}" -lt 1 ]; then
+            echo "::error::$BASE has no required status checks, so auto-merge would merge untested. Not arming; move the pull request gate ruleset to $BASE first."
+            exit 1
+          fi
+          echo "$BASE enforces $n required checks; arming."
+
+      # --merge, not the default, and not squash or rebase. The ruleset allows
+      # merge commits ONLY, and asking for a method it forbids fails rather
+      # than falling back.
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+        # DELIBERATELY NOT continue-on-error.
+        #
+        # It was, on the first cut, with the reasoning that arming is a
+        # convenience and should never fail a pull request. That reasoning is
+        # sound and the behaviour was still wrong: this job failed on its very
+        # first run -- the token lacked contents write -- and reported
+        # conclusion "success" anyway. The failure was visible only by reading
+        # the raw log, which is precisely the silent failure this project
+        # treats as a bug in its own right.
+        #
+        # Failing loudly costs nothing here. This job is NOT one of the nine
+        # required contexts, so a red mark on it cannot block a merge; it just
+        # means that when arming breaks, somebody can see that it broke
+        # instead of quietly going back to pressing the button by hand.
+        run: |
+          gh pr merge "$PR" \
+            --repo "${{ github.repository }}" \
+            --merge \
+            --auto

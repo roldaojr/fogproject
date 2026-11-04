@@ -1,5 +1,11 @@
 #!/usr/bin/env sh
 #
+# Runs on "git commit" once enabled. Exits non-zero to block the commit if
+# schemaCheck() below fails; every other check here fails open.
+#
+# To enable this hook:
+#   git config core.hooksPath .githooks
+#
 # Exit on error
 # set -e
 
@@ -26,8 +32,14 @@ psrfix() {
     # octal-escaped. -z is not used because POSIX sh cannot read NUL
     # delimited input; a newline in a filename would still break this, and
     # nothing in this repo has one.
+    # vendor/ is excluded because reformatting third-party source is exactly
+    # the thing that makes a dependency unupdatable: the next `composer
+    # install` rewrites the files, the fixer rewrites them back, and the diff
+    # never settles. It also silently forks code whose whole value is being
+    # identical to what upstream published.
     git -c core.quotePath=false diff --cached --name-only \
-        --diff-filter=ACMR -- 'packages/web/*.php' |
+        --diff-filter=ACMR -- 'packages/web/*.php' \
+        ':(exclude)packages/web/vendor/*' |
     while IFS= read -r f; do
         [ -n "$f" ] || continue
 
@@ -47,11 +59,132 @@ psrfix() {
 }
 
 updateLanguage() {
+    # Only when this commit touches a PHP file under packages/web. That is the
+    # only thing update-language.sh extracts from -- xgettext --language=PHP
+    # over a find for *.php under packages/web -- so nothing else in a commit
+    # can make the catalogues go stale. Same reasoning as schemaCheck below.
+    #
+    # Without this gate the step regenerated on every commit and staged the
+    # whole languages directory, so a CSS-only change carried ten .po files
+    # and messages.pot into working-1.6 (b6be8033f, 2026-09-04). CI runs the
+    # identical regeneration and commits the result when the tree comes back
+    # dirty, so a run skipped here is caught there rather than lost.
+    if ! git diff --cached --name-only --diff-filter=ACMR \
+        | grep -q '^packages/web/.*\.php$'; then
+        return
+    fi
+
     require_tools "translation template regeneration" xgettext msgcat msgmerge || return
+
+    # Whatever was already dirty before we ran belongs to somebody else -- a
+    # second session in this checkout, or an edit the author deliberately left
+    # unstaged. psrfix() above refuses to touch a partially staged file for
+    # the same reason; this is that caution applied to the catalogues.
+    langdir="packages/web/management/languages"
+    before=$(git diff --name-only -- "$project_dir/$langdir")
+
     # The regeneration itself lives in lib/ so CI runs the identical commands.
     sh "$project_dir/.githooks/lib/update-language.sh" "$project_dir"
-    git add "$project_dir/packages/web/management/languages/"
+
+    # Stage only what the regeneration changed and nobody else was holding.
+    git diff --name-only -- "$project_dir/$langdir" | while read -r f; do
+        if printf '%s\n' "$before" | grep -Fxq -- "$f"; then
+            printf 'pre-commit: %s was already modified, leaving it unstaged\n' \
+                "$f" >&2
+        else
+            git add "$project_dir/$f"
+        fi
+    done
 }
+
+schemaCheck() {
+    # Only when this commit actually touches the schema or its manifest.
+    # Nothing else can make either of these go stale, and a schema gate that
+    # fires on unrelated commits is a gate people learn to bypass.
+    touched=$(git diff --cached --name-only --diff-filter=ACMR -- \
+        'packages/web/commons/schema.php' \
+        'packages/web/commons/schema-expected.php' \
+        'bin/schema-reference-1.5.php')
+    [ -n "$touched" ] || return 0
+
+    # Branches without a manifest have nothing to keep in step.
+    #
+    # core.hooksPath is an absolute path, so every linked worktree runs the
+    # MAIN worktree's copy of this hook whatever branch it has checked out --
+    # and dev-branch carries neither bin/schema-manifest.php nor
+    # commons/schema-expected.php, because SchemaReconciler is 1.6-only. So a
+    # schema commit there ran a 1.6 gate against a 1.5 tree and aborted on
+    # "Could not open input file", which reads as a broken hook rather than a
+    # branch that was never in scope.
+    #
+    # This is NOT the fail-open the php check below refuses to be. That one
+    # is "the manifest exists and I cannot check it"; this is "there is no
+    # manifest, so nothing can be stale". Both files are required, so a tree
+    # that has the manifest but has lost the generator still fails closed
+    # further down.
+    if [ ! -f "$project_dir/bin/schema-manifest.php" ] \
+        || [ ! -f "$project_dir/packages/web/commons/schema-expected.php" ]; then
+        return 0
+    fi
+
+    # FAILS CLOSED, unlike every other check in this hook.
+    #
+    # This used to be `command -v php || return 0` at the top of the function,
+    # which silently disabled the only blocking gate here on any machine without
+    # the PHP CLI -- and disabled it for every commit, not just schema ones.
+    #
+    # The other checks fail open because a missed PSR2 pass or a stale .pot is
+    # recoverable by the next person who has the tools. A stale
+    # schema-expected.php is not: SchemaReconciler compares live databases
+    # against that manifest, so an upgrading 1.5 install never receives the new
+    # structure, and nothing surfaces it until someone's upgrade quietly does
+    # nothing. That is a correctness defect reaching users, so a commit that
+    # cannot be checked is refused rather than waved through.
+    #
+    # Ordered after the "touched" test on purpose: a contributor without php can
+    # still commit anything that does not touch the schema.
+    if ! command -v php >/dev/null 2>&1; then
+        printf 'pre-commit: this commit changes the schema but php is not installed,\n' >&2
+        printf 'pre-commit: so schema-expected.php cannot be verified -- commit aborted.\n' >&2
+        printf 'pre-commit: install the PHP CLI package, or re-run with --no-verify only\n' >&2
+        printf 'pre-commit: if you are certain the manifest is already current.\n' >&2
+        return 1
+    fi
+
+    # BLOCKING: the manifest no longer describes what schema.php builds.
+    # SchemaReconciler compares a live database against that manifest, so a
+    # stale one means it silently stops knowing about the new structure and
+    # an upgrading 1.5 install never receives it. That is a defect in THIS
+    # commit and the fix is one command, so refuse the commit.
+    if ! php "$project_dir/bin/schema-manifest.php" check \
+        "$project_dir/packages/web"; then
+        printf 'pre-commit: schema-expected.php is stale -- commit aborted\n' >&2
+        return 1
+    fi
+
+    # ADVISORY: structure 1.5 has that 1.6 does not.
+    #
+    # 1.5.x was supposed to be frozen but keeps taking security-driven
+    # schema changes, so this is the check for the inverse failure -- 1.6
+    # forgetting to carry one across. It cannot be detected at runtime,
+    # because a 1.6 tree has no way to know what 1.5 added.
+    #
+    # Deliberately NOT blocking: a port that has not happened yet is a real
+    # finding but is not necessarily this commit's fault, and blocking every
+    # subsequent schema commit until it is resolved would just get the hook
+    # disabled. Refresh the reference with:
+    #   php bin/schema-manifest.php generate <1.5-web-root> bin/schema-reference-1.5.php
+    ref="$project_dir/bin/schema-reference-1.5.php"
+    if [ -f "$ref" ]; then
+        if ! php "$project_dir/bin/schema-manifest.php" diff "$ref" \
+            "$project_dir/packages/web/commons/schema-expected.php"; then
+            printf 'pre-commit: WARNING -- 1.6 lacks structure present in 1.5 (see above)\n' >&2
+        fi
+    fi
+    return 0
+}
+
+schemaCheck || exit 1
 
 updateLanguage
 psrfix
@@ -61,13 +194,14 @@ psrfix
 #
 # The version is `git rev-list master..HEAD --count` put through
 # .githooks/lib/fog-version.sh -- a function of the commit graph. Stamping it
-# into a tracked line of packages/web/lib/fog/system.class.php on every commit
-# meant that any two branches open at once wrote DIFFERENT values to the SAME
-# line, so merging the base back into either one conflicted, every time, by
+# into a tracked line of packages/web/src/Base/System.php on every commit meant
+# that any two branches open at once wrote DIFFERENT values to the SAME line,
+# so merging the base back into either one conflicted, every time, by
 # construction. Not a race: there is no ordering of commits that avoids it.
 #
-# It is also what left a dangling staged system.class.php bump behind after a
-# commit, which this branch's CLAUDE.md used to have to warn about.
+# Measured on this repository: PR #1504 needed three separate version commits
+# (4598 -> 4600 -> 4608) as other pull requests landed around it, and the merge
+# 3fbacbc73 records the conflict this hook caused in its own commit message.
 #
 # The version is now written in exactly one place -- on the base branch, after
 # a merge, by .github/workflows/sync-generated-files.yml -- where there is only
@@ -78,7 +212,7 @@ psrfix
 # locally leaves FOG_VERSION reading whatever the last merge into the base
 # branch set. It is BEHIND on a feature branch, on purpose. Do not "fix" that
 # by putting the stamp back; a version that is a few commits stale costs a
-# wrong number in a build string, and stamping it per-commit costs a
+# wrong number in a beta build string, and stamping it per-commit costs a
 # hand-resolved conflict on every open pull request every time anything
 # merges.
 #
@@ -86,8 +220,6 @@ psrfix
 # with the branch, was removed in the same change: with nothing stamping a
 # version there is nothing for it to guard, and it would have blocked every
 # push instead.
-#
-# Ported from working-1.6 (GH-1510), where the bug was diagnosed.
 
 # GH-1581: the hook's exit status is the status of the last command, which was
 # psrfix -- and psrfix returns 1 when php-cs-fixer is not installed, via
@@ -99,6 +231,4 @@ psrfix
 # formatter is a skip, not a failure, and CI regenerates all of it. Nothing in
 # this hook is a gate. Say so explicitly rather than leaving the status to
 # whichever helper happens to run last -- post-commit already ends this way.
-#
-# Ported from working-1.6, where it was diagnosed and fixed first.
 exit 0

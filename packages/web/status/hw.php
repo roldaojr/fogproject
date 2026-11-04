@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Router\HTTPResponseCodes;
+
 /**
  * Presents Hardware/Software information of the server.
  *
@@ -27,14 +31,11 @@ header('Content-Type: text/event-stream');
 // Allow local authenticated users and trusted node-to-node requests.
 $isAuthorizedUser = FOGCore::is_authorized(true);
 $remoteIP = filter_input(INPUT_SERVER, 'REMOTE_ADDR');
-Route::ids('storagenode', [], 'ip');
-$storageNodeIPs = json_decode(Route::getData(), true) ?: [];
-$trustedIPs = array_merge(
-    (array)$storageNodeIPs,
-    ['127.0.0.1', '::1']
-);
-$isTrustedCaller = is_string($remoteIP)
-    && in_array($remoteIP, $trustedIPs, true);
+// The IP list covers storage nodes in this server's own database. A peer
+// that is a full FOG server has its own database and is never in it, so
+// a request signed with a node key this server holds is trusted too.
+$isTrustedCaller = FOGCore::isTrustedNodeIp($remoteIP)
+    || FOGCore::validNodeSignature();
 if (!$isAuthorizedUser && !$isTrustedCaller) {
     http_response_code(HTTPResponseCodes::HTTP_UNAUTHORIZED);
     echo json_encode(_('Unauthorized'));

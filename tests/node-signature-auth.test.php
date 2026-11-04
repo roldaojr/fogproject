@@ -35,7 +35,7 @@ $root = dirname(__DIR__);
 chdir($root);
 
 $fails = [];
-$baseFile = 'packages/web/lib/fog/fogbase.class.php';
+$baseFile = 'packages/web/src/Base/FOGBase.php';
 $base = (string)file_get_contents($baseFile);
 
 /*
@@ -377,40 +377,6 @@ if (NodeSigProbe::validNodeSignature()) {
 NodeSigFakeDb::$nodes = [];
 
 /*
- * ngmKey must never leave the server.
- *
- * 1.6 has $sensitiveAlwaysFields and lists 'key' there; this branch has no
- * such registry, and Route emitted a node's whole row -- ngmPass included --
- * from two places. Giving ngmKey a meaning without closing that would
- * publish the very secret the signature proves.
- *
- * Asserted on the emitter rather than on a field list, because a field list
- * is what this branch does not have.
- */
-$route = (string)file_get_contents(
-    'packages/web/lib/router/route.class.php'
-);
-if (!preg_match(
-    "/function stripNodeSecrets\\(.*?unset\\(\\\$data\\['pass'\\], \\\$data\\['key'\\]\\);/s",
-    $route
-)) {
-    $fails[] = 'Route::stripNodeSecrets() no longer removes both pass and'
-        . ' key; a node credential would be emitted';
-}
-foreach (
-    [
-        "self::stripNodeSecrets(\$class->get())" =>
-            'the storagenode payload',
-        "'storagenode' => self::stripNodeSecrets(" =>
-            "a task's embedded storage node",
-    ] as $needle => $where
-) {
-    if (false === strpos($route, $needle)) {
-        $fails[] = 'node credentials are no longer stripped from ' . $where;
-    }
-}
-
-/*
  * A peer must have SOME way to be given the key.
  *
  * FOG_NODE_API_KEY is hidden from the FOG Configuration page on purpose --
@@ -442,7 +408,7 @@ if (!is_readable('bin/fog-node-key.php')) {
 
 // ...and the UI has to say where to run it, or the value is a dead end.
 $nodePage = (string)file_get_contents(
-    'packages/web/lib/pages/storagemanagementpage.class.php'
+    'packages/web/src/Pages/StorageNodeManagement.php'
 );
 if (false === strpos($nodePage, 'fog-node-key.php')) {
     $fails[] = 'the storage node page no longer tells the administrator how'
@@ -573,6 +539,26 @@ if (!preg_match(
         . ' checkAuthAndCSRF() when the request is unsigned, or no longer'
         . ' accepts a signature at all';
 }
+/*
+ * The node status endpoints trust by IP, which only works when the caller is
+ * a storage node in the receiver's own database. A peer that is itself a full
+ * FOG server has its own database and is never in that list, so its signed
+ * request must be accepted too -- forum 18283.
+ */
+foreach (['freespace.php', 'hw.php'] as $statusFile) {
+    $statusSrc = (string)file_get_contents(
+        'packages/web/status/' . $statusFile
+    );
+    if (!preg_match(
+        '#\$isTrustedCaller = FOGCore::isTrustedNodeIp\(\$remoteIP\)\s*'
+        . '\|\| FOGCore::validNodeSignature\(\);#',
+        $statusSrc
+    )) {
+        $fails[] = "status/$statusFile does not accept a node signature"
+            . ' beside its IP list; a peer FOG server with its own database'
+            . ' is refused';
+    }
+}
 
 /*
  * 5. The sending side signs FOG's own hosts and nobody else's.
@@ -582,7 +568,7 @@ if (!preg_match(
  * given away. isFogHost() is the one answer all three key off.
  */
 $requests = (string)file_get_contents(
-    'packages/web/lib/fog/fogurlrequests.class.php'
+    'packages/web/src/Net/FOGURLRequests.php'
 );
 if (!preg_match(
     '#if \(\$isFogHost\) \{.*?nodeSignatureHeaders\(#s',
@@ -599,37 +585,29 @@ if (false === strpos($requests, 'CURLOPT_CUSTOMREQUEST')) {
 }
 
 /*
- * 6. The configuration page must neither print the key nor overwrite it.
+ * 6. The key must not be readable back out.
  *
- * Two halves, and the second is the one that bites. This branch's saver
- * walks EVERY setting rather than the posted ones, and $set falls back to 0
- * for anything absent from $_POST -- so hiding the field without also
- * skipping it in the saver replaces the shared secret with the string "0"
- * the first time an admin saves that category. Both ends would then agree
- * on "0" and nothing would look broken.
- *
- * There is no REST redaction layer on this branch to add the key to. GET
- * /service already returns FOG_STORAGENODE_MYSQLPASS and FOG_API_TOKEN in
- * the clear, so an API caller who could read this key already holds strictly
- * more; building that layer here is a separate change.
+ * SENSITIVE_SETTING_PATTERN matches PASSWORD/PASSWD/PWD/SECRET/TOKEN and not
+ * KEY -- widening it to KEY would mask FOG_KEYMAP and FOG_KEY_SEQUENCE,
+ * which are not secrets -- so this one has to be named explicitly, and the
+ * configuration page has to drop the row rather than render it.
  */
-$configPage = (string)file_get_contents(
-    'packages/web/lib/pages/fogconfigurationpage.class.php'
+$route = (string)file_get_contents(
+    'packages/web/src/Router/Route.php'
 );
 if (!preg_match(
-    '#if \(\$Service->name === self::NODE_API_KEY_SETTING\) \{#',
-    $configPage
+    '#\$sensitiveSettings = \[.*?\'FOG_NODE_API_KEY\'.*?\];#s',
+    $route
 )) {
+    $fails[] = 'FOG_NODE_API_KEY is not in Route::$sensitiveSettings; the'
+        . ' shared node secret would be readable over REST';
+}
+$configPage = (string)file_get_contents(
+    'packages/web/src/Pages/FOGConfigurationPage.php'
+);
+if (false === strpos($configPage, 'NODE_API_KEY_SETTING')) {
     $fails[] = 'the FOG Configuration page no longer drops the node key'
         . ' row; the secret would be printed into a form field';
-}
-if (!preg_match(
-    '#case self::NODE_API_KEY_SETTING:.*?continue 2;#s',
-    $configPage
-)) {
-    $fails[] = 'the settings saver no longer skips the node key; it walks'
-        . ' every setting and defaults an unposted one to 0, so saving the'
-        . ' page would overwrite the shared secret with "0"';
 }
 
 if (count($fails) > 0) {

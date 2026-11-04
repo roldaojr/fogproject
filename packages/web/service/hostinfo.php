@@ -10,6 +10,13 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Agent\DirectoryJoin;
+use FOG\Base\FOGCore;
+use FOG\Items\Image;
+use FOG\Items\MulticastSession;
+use FOG\Router\Route;
+
 /**
  * Hostinfo returns the host information
  *
@@ -19,53 +26,55 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
 header('Content-Type: text/plain');
 try {
     FOGCore::getHostItem(false);
     $Task = FOGCore::$Host->get('task');
-    if (FOGCore::$useragent) {
-        throw new Exception(_('Cannot view from browser'));
-    }
+    //if (FOGCore::$useragent) {
+    //    throw new Exception(_('Cannot view from browser'));
+    //}
     if (!$Task->isValid()) {
-        throw new Exception(_('Invalid tasking!'));
+        throw new \Exception(_('Invalid tasking!'));
     }
     $hosttoken = filter_input(INPUT_POST, 'hosttoken');
     if (!$hosttoken) {
         $hosttoken = filter_input(INPUT_GET, 'hosttoken');
     }
     if (!$hosttoken) {
-        throw new Exception(_('No token passed to authenticate this host'));
+        throw new \Exception(_('No token passed to authenticate this host'));
     }
     if (!FOGCore::$Host->get('tokenlock')) {
-        throw new Exception(_('Have not locked the host for access'));
+        throw new \Exception(_('Have not locked the host for access'));
     }
     if ($hosttoken != FOGCore::$Host->get('token')) {
-        throw new Exception(_('Invalid token passed for host'));
+        throw new \Exception(_('Invalid token passed for host'));
     }
-    $TaskType = FOGCore::getClass(
-        'TaskType',
-        $Task->get('typeID')
-    );
+    $TaskType = $Task->getTaskType();
     $Image = $Task->getImage();
     if ($TaskType->isInitNeededTasking()) {
         if ($TaskType->isMulticast()) {
-            $msIDs = FOGCore::getSubObjectIDs(
-                'MulticastSessionAssociation',
-                array('taskID' => $Task->get('id')),
-                'msID'
+            $ids = Route::getList(
+                'multicastsessionassociation',
+                ['taskID' => $Task->get('id')]
             );
-            $MulticastSession = FOGCore::getClass(
-                'MulticastSession',
-                FOGCore::maxId($msIDs)
-            );
-            // Without this an absent/stale session yields an invalid model
-            // whose image is '', and the block below would then write that ''
-            // into both the task and the host imageID -- corrupting the host
-            // record over a transient tasking problem. Fail the request the
-            // same way the guards above it do instead.
+            $msIDs = [];
+            foreach ($ids as $id) {
+                $msIDs[] = $id->msID;
+            }
+
+            $MulticastSession = new MulticastSession(FOGCore::maxId($msIDs));
             if (!$MulticastSession->isValid()) {
-                throw new Exception(_('Invalid Multicast Session'));
+                throw new \Exception(_('Invalid Multicast Session'));
             }
             $taskImgID = $Task->get('imageID');
             $mcImgID = $MulticastSession->get('image');
@@ -82,11 +91,11 @@ try {
         $StorageGroup = $StorageNode = null;
         $HookManager->processEvent(
             'BOOT_TASK_NEW_SETTINGS',
-            array(
+            [
                 'Host' => &FOGCore::$Host,
                 'StorageNode' => &$StorageNode,
                 'StorageGroup' => &$StorageGroup
-            )
+            ]
         );
         if (!$StorageGroup || !$StorageGroup->isValid()) {
             $StorageGroup = $Image->getStorageGroup();
@@ -127,39 +136,40 @@ try {
             (bool)$Task
             ->get('shutdown')
         );
+        $find = [
+            'name' => [
+                'FOG_CAPTUREIGNOREPAGEHIBER',
+                'FOG_CAPTURERESIZEPCT',
+                'FOG_CHANGE_HOSTNAME_EARLY',
+                'FOG_TFTP_HOST'
+            ]
+        ];
+        $items = Route::getIds(
+            'setting',
+            $find,
+            'value'
+        );
+        $values = [];
+        foreach ($items as $item) {
+            $values[] = $item->value;
+        }
         list(
             $ignorepg,
             $pct,
             $hostearly,
             $ftp
-        ) = FOGCore::getSubObjectIDs(
-            'Service',
-            array(
-                'name' => array(
-                    'FOG_CAPTUREIGNOREPAGEHIBER',
-                    'FOG_CAPTURERESIZEPCT',
-                    'FOG_CHANGE_HOSTNAME_EARLY',
-                    'FOG_TFTP_HOST'
-                )
-            ),
-            'value',
-            false,
-            'AND',
-            'name',
-            false,
-            ''
-        );
+        ) = $values;
         $ftp = (
             $StorageNode->isValid() ?
             $StorageNode->get('ip') :
             $ftp
         );
-        if (!$pct < 100
-            && !$pct > 4
+        if ($pct < 5
+            || $pct >= 100
         ) {
             $pct = 5;
         }
-        if ($TaskType->get('id') === 11) {
+        if ($TaskType->get('id') == 11) {
             $winuser = $Task
                 ->get('passreset');
         }
@@ -178,25 +188,37 @@ try {
             true
         )
     );
-    $pass = FOGCore::$Host->get('ADPass');
-    $passtest = FOGCore::aesdecrypt($pass);
-    if ($test_base64 = base64_decode($passtest)) {
-        if (mb_detect_encoding($test_base64, 'utf-8', true)) {
-            $pass = $test_base64;
+    // The join account goes to FOS only for a host that joins a domain.
+    // With useAD off nothing on the client consumes it, so it stays here.
+    $adUser = $pass = '';
+    if (FOGCore::$Host->get('useAD')) {
+        $pass = FOGCore::$Host->get('ADPass');
+        $passtest = FOGCore::aesdecrypt($pass);
+        if ($test_base64 = base64_decode($passtest)) {
+            if (mb_detect_encoding($test_base64, 'utf-8', true)) {
+                $pass = $test_base64;
+            }
         } elseif (mb_detect_encoding($passtest, 'utf-8', true)) {
             $pass = $passtest;
         }
+        // The account for the host's domain, which a plugin may supply
+        // (GH-1887): FOS gets the same join account the clients do.
+        list($adUser, $pass) = DirectoryJoin::account(
+            FOGCore::$Host,
+            (string)FOGCore::$Host->get('ADUser'),
+            (string)$pass
+        );
     }
     $productKey = FOGCore::$Host->get('productKey');
     $productKeytest = FOGCore::aesdecrypt($productKey);
     if ($test_base64 = base64_decode($productKeytest)) {
         if (mb_detect_encoding($test_base64, 'utf-8', true)) {
             $productKey = $test_base64;
-        } elseif (mb_detect_encoding($productKeytest, 'utf-8', true)) {
-            $productKey = $productKeytest;
         }
+    } elseif (mb_detect_encoding($productKeytest, 'utf-8', true)) {
+        $productKey = $productKeytest;
     }
-    $repFields = array(
+    $repFields = [
         // Imaging items to set
         'mac' => $mac,
         'ftp' => $ftp,
@@ -229,9 +251,9 @@ try {
         'hostbuilding' => FOGCore::$Host->get('building'),
         'hostusead' => FOGCore::$Host->get('useAD'),
         'hostaddomain' => FOGCore::$Host->get('ADDomain'),
-        'hostaduser' => FOGCore::$Host->get('ADUser'),
-        'hostadpass' => trim($pass),
+        'hostaduser' => $adUser,
         'hostadou' => str_replace(';', '', FOGCore::$Host->get('ADOU')),
+        'hostadpass' => trim($pass),
         'hostproductkey' => trim($productKey),
         'imagename' => $Image->get('name'),
         'imagedesc' => $Image->get('description'),
@@ -250,12 +272,12 @@ try {
         'caseman' => $Inventory->get('caseman'),
         'caseserial' => $Inventory->get('caseserial'),
         'caseasset' => $Inventory->get('caseasset'),
-    );
+    ];
     $TaskArgs = preg_split(
         '#[\s]+#',
         trim($TaskType->get('kernelArgs'))
     );
-    foreach ((array)$TaskArgs as $key => &$val) {
+    foreach ((array)$TaskArgs as $key => $val) {
         $val = trim($val);
         if (strpos($val, '=') === false) {
             continue;
@@ -264,23 +286,21 @@ try {
         if (count($nums) > 0) {
             $repFields[$nums[0]] = $nums[1];
         }
-        unset($val);
     }
     $HookManager->processEvent(
         'HOST_INFO_EXPOSE',
-        array(
+        [
             'repFields' => &$repFields,
             'Host'=>&FOGCore::$Host
-        )
+        ]
     );
-    foreach ((array)$repFields as $key => &$val) {
+    foreach ((array)$repFields as $key => $val) {
         printf(
             "[[ -z $%s ]] && export %s=%s\n",
             $key,
             $key,
             escapeshellarg($val)
         );
-        unset($val);
     }
     // Unset lock and update token
     $new_tok = FOGCore::createSecToken();
@@ -292,7 +312,7 @@ try {
             'tokenlock' => false
         ]
     );
-} catch (Exception $e) {
+} catch (\Exception $e) {
     echo Initiator::e($e->getMessage());
     exit(1);
 }

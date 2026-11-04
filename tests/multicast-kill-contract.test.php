@@ -22,13 +22,14 @@
  * shipped method, not a copy of its shape. No root, no database and no
  * daemon: FOGService is loaded against a stub parent and driven directly.
  *
- * Ported from working-1.6. This branch is not namespaced, so the stub
- * parent and the probe class are declared globally; everything else is
- * identical, because the defect was.
- *
  * Usage: php tests/multicast-kill-contract.test.php
  * Exit status 0 = pass, 1 = fail.
  */
+
+namespace FOG;
+
+// The probe below extends the real class, which Move 2 put in FOG\Service.
+use FOG\Service\FOGService;
 
 if (!function_exists('proc_open') || !function_exists('posix_kill')) {
     fwrite(STDERR, "SKIP: proc_open/posix_kill unavailable\n");
@@ -47,7 +48,7 @@ if (!defined('SIGTERM') || !defined('SIGKILL')) {
     exit(0);
 }
 // killAll() shells out to ps to walk the process tree, and returns without
-// signalling anything if it is missing.
+// signaling anything if it is missing.
 exec('command -v ps', $psOut, $psRet);
 if (0 !== $psRet) {
     fwrite(STDERR, "SKIP: no ps on PATH\n");
@@ -65,8 +66,13 @@ abstract class FOGBase
 {
 }
 
+// Publishes the FOGBase stub above as FOG\Base\FOGBase, which is the name
+// FOGService imports since Move 2. See the file for why this is derived from
+// the tree rather than hardcoded.
+require_once __DIR__ . '/lib/stub-buckets.php';
+
 require_once dirname(__DIR__)
-    . '/packages/web/lib/service/fogservice.class.php';
+    . '/packages/web/src/Service/FOGService.php';
 
 /**
  * Concrete handle on the abstract service.
@@ -107,7 +113,7 @@ function check($label, $cond)
  */
 function spawn($cmd)
 {
-    $svc = (new ReflectionClass('KillProbe'))
+    $svc = (new \ReflectionClass('FOG\KillProbe'))
         ->newInstanceWithoutConstructor();
     $descriptor = [
         0 => ['pipe', 'r'],
@@ -180,7 +186,7 @@ function pidPresent($pid)
 
 // The unraced anchor: this process has been running long enough that no
 // execve window applies to it.
-$svc = (new ReflectionClass('KillProbe'))->newInstanceWithoutConstructor();
+$svc = (new \ReflectionClass('FOG\KillProbe'))->newInstanceWithoutConstructor();
 check('a long-running pid reads as alive', $svc->isPidAlive(getmypid()));
 
 list($svc, $pid) = spawn('sleep 30');
@@ -309,7 +315,7 @@ set_error_handler(
         return true;
     }
 );
-$svc = (new ReflectionClass('KillProbe'))->newInstanceWithoutConstructor();
+$svc = (new \ReflectionClass('FOG\KillProbe'))->newInstanceWithoutConstructor();
 $svc->procRef = [];
 $svc->procPipes = [];
 $never = $svc->killTasking();
@@ -338,7 +344,7 @@ check('an already-exited child reports gone', $svc->killTasking());
 // true whenever its pipe bookkeeping was missing -- leaving a live lftp
 // running and telling the caller it was gone.
 
-$svc = (new ReflectionClass('KillProbe'))->newInstanceWithoutConstructor();
+$svc = (new \ReflectionClass('FOG\KillProbe'))->newInstanceWithoutConstructor();
 $descriptor = [0 => ['pipe', 'r'], 2 => ['file', '/dev/null', 'a']];
 $ref = proc_open('sleep 30', $descriptor, $pipes);
 $status = proc_get_status($ref);
@@ -382,9 +388,9 @@ check(
 // The product wiring, so this file fails if the answer stops being used.
 
 $taskFile = dirname(__DIR__)
-    . '/packages/web/lib/service/multicasttask.class.php';
+    . '/packages/web/src/Service/MulticastTask.php';
 $mgrFile = dirname(__DIR__)
-    . '/packages/web/lib/service/multicastmanager.class.php';
+    . '/packages/web/src/Service/MulticastManager.php';
 $task = file_get_contents($taskFile);
 $mgr = file_get_contents($mgrFile);
 

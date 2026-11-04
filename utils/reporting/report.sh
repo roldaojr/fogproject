@@ -8,28 +8,36 @@ read -r os_name os_version <<< $(lsb_release -ir | cut -d':' -f2 | sed -e 's/^[[
 [[ -z $os_version ]] && os_version=$(sed -n 's/^VERSION_ID=\([^.]*\).*/\1/p' /etc/os-release | tr -d '"')
 
 # Get the FOG Version.
-source /opt/fog/.fogsettings
-system_class_php=${docroot}/${webroot}/lib/fog/system.class.php
+# GH-850: this runs from cron at $fogprogramdir/reporting/report.sh with no
+# installer context, so resolve the base path from the pointer the installer
+# wrote before reading .fogsettings out of it.
+[[ -z $fogprogramdir && -r /etc/fog/fog.conf ]] && source /etc/fog/fog.conf
+[[ -z $fogprogramdir ]] && fogprogramdir="/opt/fog"
+source ${fogprogramdir%/}/.fogsettings
+# Both spellings: this cron job reads the installed web tree, and the version
+# file moved to src/Base/System.php when core became PSR-4 on working-1.6.
+system_class_php=${WEB_docroot}/${WEB_root}/src/Base/System.php
+[[ ! -f ${system_class_php} ]] && system_class_php=${WEB_docroot}/${WEB_root}/lib/fog/system.class.php
 fog_version=$(cat ${system_class_php} | grep FOG_VERSION | cut -d',' -f2 | cut -d"'" -f2)
 
 # Construct correct mysql options.
 options="-sN"
-if [[ $snmysqlhost != "" ]]; then
-        options="$options -h$snmysqlhost"
+if [[ ${DB_host} != "" ]]; then
+        options="$options -h${DB_host}"
 fi
-if [[ $snmysqluser != "" ]]; then
-        options="$options -u$snmysqluser"
+if [[ ${DB_user} != "" ]]; then
+        options="$options -u${DB_user}"
 fi
-if [[ $snmysqlpass != "" ]]; then
-        options="$options -p$snmysqlpass"
+if [[ ${DB_password} != "" ]]; then
+        options="$options -p${DB_password}"
 fi
-options="$options -D $mysqldbname -e"
+options="$options -D ${DB_name} -e"
 
 # Construct sql statements.
 FOG_TFTP_PXE_KERNEL_32_select='select settingValue from globalSettings WHERE settingKey = "FOG_TFTP_PXE_KERNEL_32";'
 FOG_TFTP_PXE_KERNEL_select='select settingValue from globalSettings WHERE settingKey = "FOG_TFTP_PXE_KERNEL";'
 FOG_TFTP_PXE_KERNEL_DIR_select='select settingValue from globalSettings WHERE settingKey = "FOG_TFTP_PXE_KERNEL_DIR";'
-FOG_HOSTS_KERNELS_select='SELECT UNIQUE hostKernel FROM hosts;'
+FOG_HOSTS_KERNELS_select='SELECT DISTINCT hostKernel FROM hosts;'
 
 # Execute sql statements, get values.
 FOG_TFTP_PXE_KERNEL_32=$(mysql $options "$FOG_TFTP_PXE_KERNEL_32_select")
@@ -108,7 +116,7 @@ for host_kernel in $FOG_HOST_KERNELS; do
                 kernel_versions_info="${kernel_versions_info}${version}"
             fi
         fi
-    fi    
+    fi
 done
 
 # Finish JSON list formatting.

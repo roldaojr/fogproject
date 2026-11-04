@@ -1,0 +1,105 @@
+(function($) {
+  var kernelData = {},
+    downloadSelected = $('#download-send');
+  downloadSelected.prop('disabled', true);
+  Pace.track(function() {
+    $.ajax({
+      url: '../management/index.php?sub=getKernels',
+      type: 'get',
+      cache: false,
+      dataType: 'json',
+      success: function(data, textStatus, jqXHR) {
+        // The route answers with the releases under `data`, the same
+        // envelope every list route uses. DataTables' `data` option takes
+        // the rows themselves, so hand it the rows -- tolerating both
+        // shapes, as the host list's group typeahead does.
+        var rows = (data && data.data) ? data.data : data;
+        function onSelect(selected) {
+          var disabled = selected.count() == 0;
+          downloadSelected.prop('disabled', disabled);
+        };
+        var downloadModal = $('#downloadModal'),
+          confirmDownloadBtn = $('#confirmDownload'),
+          table = $('#dataTable').registerTable(onSelect, {
+            data: rows,
+            select: {
+              style: 'single'
+            },
+            order: [
+              [0, 'desc']
+            ],
+            columns: [
+              {data: 'tag_name'},
+              {data: 'version'},
+              {data: 'arch'},
+              {data: 'type'},
+              {data: 'date'}
+            ],
+            rowId: 'download',
+            buttons: [],
+            rowGroup: {
+              dataSrc: 'date'
+            }
+          });
+        table.on('draw', function() {
+          onSelect(table.rows({selected: true}));
+        });
+        var downloadurl,
+          downloadparts,
+          parts = {};
+        downloadSelected.on('click', function(e) {
+          e.preventDefault();
+          downloadModal.modal('show');
+          downloadurl = table.rows({selected: true}).ids();
+          rowData = table.rows({selected: true}).data();
+          downloadparts = getQueryParams(downloadurl[0]);
+          parts = {
+            node: downloadparts['node'],
+            sub: downloadparts['sub'],
+            url: downloadparts['file'],
+            arch: downloadparts['arch'],
+            buildroot: rowData[0].version,
+            tag_name: rowData[0].tag_name
+          };
+          val = parts.arch == 32 ? 'bzImage32' : (parts.arch == 'arm64' ? 'arm_Image' : 'bzImage');
+          $('#kernel-name').prop('placeholder', val).prop('value', val);
+        });
+        confirmDownloadBtn.on('click', function(e) {
+          e.preventDefault();
+          var dstName = $('#kernel-name').val(),
+            opts = {
+              install: 1,
+              file: parts.url,
+              dstName: dstName,
+              buildroot: parts.buildroot,
+              tag_name: parts.tag_name
+            },
+            fetchurl = '../management/index.php?node='
+            + Common.node
+            + '&sub='
+            + parts.sub,
+            dlurl = '../management/index.php?sub=kernelfetch';
+          $.apiCall('post', fetchurl, opts, function(err) {
+            if (err) {
+              return;
+            }
+            $.apiCall('post', dlurl, {msg: 'dl', buildroot: opts.buildroot, tag_name: opts.tag_name}, function(err) {
+              if (err) {
+                return;
+              }
+              $.apiCall('post', dlurl, {msg: 'tftp', buildroot: opts.buildroot, tag_name: opts.tag_name}, function(err) {
+                if (err) {
+                  return;
+                }
+                downloadModal.modal('hide');
+              });
+            });
+          });
+        });
+      },
+      error: function(jqXHR, textStatus, errorThrown) {
+        $.notifyFromAPI(jqXHR.responseJSON, jqXHR);
+      }
+    });
+  });
+})(jQuery);

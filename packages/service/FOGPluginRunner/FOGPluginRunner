@@ -1,0 +1,32 @@
+#!/usr/bin/php -q
+<?php
+/**
+ * FOGPluginRunner service to run background work declared by plugins
+ *
+ * PHP version 5
+ *
+ * @category FOGPluginRunner
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+
+/**
+ * FOGPluginRunner service to run background work declared by plugins
+ *
+ * Unlike the other daemons this one runs as the web user, not root (ADR
+ * 0010): it executes third-party plugin code, and a plugin already runs as
+ * the web user everywhere else. The User=/Group= lines in the unit file are
+ * what enforce that, and installInitScript() fills them in.
+ *
+ * @category FOGPluginRunner
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+require dirname(realpath(__FILE__)).'/../etc/config.php';
+require dirname(realpath(__FILE__)).'/../lib/service_lib.php';
+service_persist('FOGPluginRunner');
+\FOG\Base\FOGCore::getClass('PluginRunner')->run();

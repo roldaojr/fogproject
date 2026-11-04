@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Managers\StorageNodeManager;
+
 /**
  * Check if the node exists and return it
  *
@@ -23,11 +27,7 @@
  */
 require '../commons/base.inc.php';
 
-// Restrict to same-machine requests only -- the installer is the only caller
-// and posts here from the server's own IP. Note that, unlike 1.6, this file
-// deliberately does NOT also require the fogverified sentinel: the 1.5
-// installer's wget call at lib/common/functions.sh does not send one, so
-// requiring it here would break node registration on every install.
+// Restrict to same-machine requests only.
 $_remoteIp = $_SERVER['REMOTE_ADDR'] ?? '';
 $_serverIp = $_SERVER['SERVER_ADDR'] ?? '';
 if ($_remoteIp !== '127.0.0.1'
@@ -39,13 +39,21 @@ if ($_remoteIp !== '127.0.0.1'
 }
 unset($_remoteIp, $_serverIp);
 
+// Require the fogverified sentinel (paired with -d "fogverified" in the
+// registerStorageNode() curl call in lib/common/functions.sh).
+if (!isset($_POST['fogverified'])) {
+    http_response_code(403);
+    exit;
+}
+
 $ip = filter_input(INPUT_POST, 'ip', FILTER_VALIDATE_IP);
 if (!$ip) {
     http_response_code(400);
     exit;
 }
+
 $val = '';
-$exists = FOGCore::getClass('StorageNodeManager')
+$exists = (new StorageNodeManager())
     ->exists($ip, '', 'ip');
 if ($exists) {
     $val = 'exists';

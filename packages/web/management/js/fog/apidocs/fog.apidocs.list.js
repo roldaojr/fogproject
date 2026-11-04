@@ -1,0 +1,212 @@
+/**
+ * Renders this server's OpenAPI document in the API Documentation page.
+ *
+ * Waits for SwaggerUIBundle rather than assuming it is already there, and the
+ * reason is FOG's own navigation. Clicking the menu item does not reload the
+ * page: fog.common.js reads X-FOG-JavaScripts off the response and appends the
+ * scripts for the new node. On that path document.readyState is already
+ * 'complete', so a DOMContentLoaded handler never fires and the naive fallback
+ * -- run immediately instead -- runs before the sibling script has finished
+ * executing. swagger-ui-bundle.js is 1.5MB, so it loses that race every time,
+ * and the page then reported a missing file when the file was there all along.
+ *
+ * The spec URL comes from a data attribute rather than being templated into
+ * the script, so it is escaped once, by PHP, as part of the markup.
+ *
+ * Deliberately does not pre-fill the signed-in user's API token. It would
+ * save a paste, at the cost of writing a live credential into the page for
+ * anything with DOM access to read. Use Authorize instead.
+ */
+/* global SwaggerUIBundle, FogRequestSnippets */
+(function () {
+    'use strict';
+
+    // 1.5MB over a slow link takes a moment; 20s is generous without spinning
+    // forever when the asset really is absent.
+    var POLL_MS = 100;
+    var MAX_TRIES = 200;
+
+    function report(container, specUrl, waitedMs) {
+        // Name which of the two things went wrong rather than always blaming
+        // the file, which sent someone looking for an asset that was present.
+        var heading = document.createElement('div');
+        heading.className = 'alert alert-warning';
+        heading.textContent = 'The API reference could not be displayed.';
+        container.appendChild(heading);
+
+        var detail = document.createElement('p');
+        detail.textContent = 'Working out why...';
+        container.appendChild(detail);
+
+        var link = document.createElement('p');
+        var anchor = document.createElement('a');
+        anchor.href = specUrl;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener';
+        anchor.textContent = 'The raw OpenAPI document is still available here.';
+        link.appendChild(anchor);
+        container.appendChild(link);
+
+        var bundleUrl = '../management/js/swagger-ui-bundle.js';
+        window.fetch(bundleUrl, { method: 'HEAD', credentials: 'same-origin' })
+            .then(function (response) {
+                if (response.ok) {
+                    detail.textContent = 'swagger-ui-bundle.js is present but had not finished '
+                        + 'loading after ' + Math.round(waitedMs / 1000) + ' seconds. Reload the '
+                        + 'page; if it keeps happening, check the browser console for a script '
+                        + 'error.';
+                } else {
+                    detail.textContent = 'swagger-ui-bundle.js is missing from the web root '
+                        + '(HTTP ' + response.status + '). Re-run the installer so the '
+                        + 'management assets are copied into place.';
+                }
+            })
+            .catch(function () {
+                detail.textContent = 'swagger-ui-bundle.js could not be fetched at all. Check '
+                    + 'that the web server serves management/js/, then reload.';
+            });
+    }
+
+    /**
+     * The snippet panel under an executed request.
+     *
+     * Off by default, and worth turning on here because the reference is the
+     * page an admin lands on to work out how to drive this server from
+     * somewhere else -- the answer being one tab away from the request they
+     * just ran beats reconstructing it from the operation blocks.
+     *
+     * fog.apidocs.snippets.js supplies the generators and the config together,
+     * because the two have to agree: a generator named in the config with no
+     * function behind it is dropped silently. If the file did not load, fall
+     * through to Swagger UI's own three curl tabs rather than rendering
+     * nothing.
+     */
+    function snippetOptions() {
+        if (typeof FogRequestSnippets === 'undefined') {
+            return {};
+        }
+        return {
+            requestSnippetsEnabled: true,
+            requestSnippets: FogRequestSnippets.config(),
+            plugins: [FogRequestSnippets.plugin]
+        };
+    }
+
+    function render(specUrl, mount) {
+        SwaggerUIBundle(Object.assign({
+            url: specUrl,
+            // domNode rather than dom_id, because the node this renders into
+            // is one we own and keep (see boot()), not the server-rendered
+            // container, which is thrown away on every page navigation.
+            domNode: mount,
+            deepLinking: true,
+            presets: [SwaggerUIBundle.presets.apis],
+            // BaseLayout deliberately, not StandaloneLayout. The latter adds
+            // the topbar with a spec URL box and an Explore button, which
+            // invites pointing this at some other server's document. There is
+            // one spec worth reading here and it is this server's.
+            layout: 'BaseLayout',
+            // 'none', not 'list'. 'list' expands every tag group on load, and
+            // this document is generated: 69 tags x the ten generic routes each
+            // class gets (list, create, get, update, delete, search, count,
+            // names, ids, join) is 716 operations, which Swagger UI renders as
+            // 17,400 DOM nodes before the page is usable. 'none' renders the 69
+            // tag headers only -- 1,672 nodes -- and expands on demand. Measured
+            // on the 1.6 lab: settled render 4.3s -> 2.5s, and every subsequent
+            // interaction stops reconciling a 17k-node tree.
+            //
+            // A hand-written spec would never hit this; one generated from the
+            // class list grows an operation block every time a class or a plugin
+            // is added, so the default that suits a 20-operation API is the wrong
+            // one here by construction.
+            docExpansion: 'none',
+            // Collapsed groups need a way in other than scrolling 69 headers.
+            filter: true,
+            // Depth 1 still walks all 70 schemas at startup. The models section
+            // is reference material read on purpose, not on arrival.
+            defaultModelsExpandDepth: 0,
+            // Same-origin, so the browser sends the session cookie and try-it
+            // works against this very server.
+            withCredentials: true
+        }, snippetOptions()));
+    }
+
+    function boot() {
+        var container = document.getElementById('apidocs-container');
+        if (!container) {
+            return;
+        }
+        var specUrl = container.getAttribute('data-spec-url');
+        if (!specUrl) {
+            return;
+        }
+        // A full page load fires DOMContentLoaded and an AJAX navigation calls
+        // boot() directly, so guard against rendering twice into one container.
+        if (container.getAttribute('data-apidocs-booted') === '1') {
+            return;
+        }
+        container.setAttribute('data-apidocs-booted', '1');
+
+        /**
+         * Reuse the console this session already built, rather than building
+         * a second one.
+         *
+         * Every visit to this page used to construct a fresh SwaggerUIBundle,
+         * and the previous one was never taken down: FOG's AJAX navigation
+         * replaces the page with ajaxPageWrapper.empty().html(data), which
+         * tears the DOM out from under React without unmounting it, and the
+         * bundle exposes no unmount API to call even if there were somewhere
+         * to call it from. Measured on the 1.6 lab with forced GC, bouncing
+         * between the dashboard and this page: 10MB, 32, 52, 70, 90 -- a flat
+         * ~20MB per visit that collection never reclaimed.
+         *
+         * The retainer lives inside the bundle and is tied to deepLinking
+         * (with it off, an instance is fully collectable; with it on, ~5MB
+         * survives per instance, and more once the re-executed bundle is held
+         * alive too). Rather than hunt a reference we cannot reach from here,
+         * this stops creating the second instance at all: the rendered node is
+         * kept and moved into each new container. One instance per session, so
+         * nothing accumulates, and coming back to the page is now a DOM move
+         * rather than a full re-render.
+         *
+         * Kept on window deliberately, not in this closure. renderPage() in
+         * fog.common.js re-adds every node script on each navigation, so this
+         * file is re-executed each visit and a closure variable would be a
+         * fresh, empty one every time.
+         */
+        var cached = window.fogApidocsConsole;
+        if (cached && cached.getAttribute('data-spec-url') === specUrl) {
+            container.appendChild(cached);
+            return;
+        }
+
+        // Our own node inside the server-rendered container. The container is
+        // replaced on every navigation; this is what survives.
+        var mount = document.createElement('div');
+        mount.setAttribute('data-spec-url', specUrl);
+        container.appendChild(mount);
+
+        var tries = 0;
+        (function waitForBundle() {
+            if (typeof SwaggerUIBundle !== 'undefined') {
+                render(specUrl, mount);
+                // Only cache once it has actually rendered, so a failed load
+                // is retried on the next visit instead of being remembered.
+                window.fogApidocsConsole = mount;
+                return;
+            }
+            tries += 1;
+            if (tries >= MAX_TRIES) {
+                report(container, specUrl, POLL_MS * tries);
+                return;
+            }
+            window.setTimeout(waitForBundle, POLL_MS);
+        }());
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        boot();
+    }
+}());

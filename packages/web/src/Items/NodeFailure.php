@@ -1,0 +1,134 @@
+<?php
+/**
+ * The node failure class.
+ *
+ * PHP version 7.4+
+ *
+ * @category NodeFailure
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+
+namespace FOG\Items;
+
+use FOG\Base\FOGController;
+
+/**
+ * The node failure class.
+ *
+ * @category NodeFailure
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+class NodeFailure extends FOGController
+{
+    /**
+     * The node failure table.
+     *
+     * @var string
+     */
+    protected $databaseTable = 'nfsFailures';
+    /**
+     * The node failure fields and common names.
+     *
+     * @var array
+     */
+    protected $databaseFields = [
+        'id' => 'nfID',
+        'storagenodeID' => 'nfNodeID',
+        'taskID' => 'nfTaskID',
+        'hostID' => 'nfHostID',
+        'storagegroupID' => 'nfGroupID',
+        'failureTime' => 'nfDateTime'
+    ];
+    /**
+     * The required fields.
+     *
+     * @var array
+     */
+    protected $databaseFieldsRequired = [
+        'storagenodeID',
+        'taskID',
+        'hostID',
+        'storagegroupID',
+        'failureTime'
+    ];
+    /**
+     * Additional fields.
+     *
+     * @var array
+     */
+    protected $additionalFields = [
+        'storagenode',
+        'storagegroup',
+        'host',
+        'task'
+    ];
+    /**
+     * Database -> Class field relationships
+     *
+     * @var array
+     */
+    protected $databaseFieldClassRelationships = [
+        'StorageNode' => [
+            'id',
+            'storagenodeID',
+            'storagenode'
+        ],
+        'StorageGroup' => [
+            'id',
+            'storagegroupID',
+            'storagegroup'
+        ],
+        'Host' => [
+            'id',
+            'hostID',
+            'host'
+        ],
+        'Task' => [
+            'id',
+            'taskID',
+            'task'
+        ]
+    ];
+    /**
+     * Returns storage node object.
+     *
+     * @return object
+     */
+    public function getStorageNode()
+    {
+        return $this->get('storagenode');
+    }
+    /**
+     * Returns task object.
+     *
+     * @return object
+     */
+    public function getTask()
+    {
+        return $this->get('task');
+    }
+    /**
+     * Returns host object.
+     *
+     * @return object
+     */
+    public function getHost()
+    {
+        return $this->get('host');
+    }
+    /**
+     * Returns the storage group object.
+     *
+     * @return object
+     */
+    public function getStorageGroup()
+    {
+        return $this->get('storagegroup');
+    }
+}

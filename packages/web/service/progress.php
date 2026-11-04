@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Items\TaskType;
+
 /**
  * Updates the progress information
  *
@@ -19,13 +23,22 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+/*
+ * A machine entry point: the caller is a booting NIC, FOS, the fog-client
+ * or a storage node, none of which can present a credential. Declared per
+ * file rather than inferred from the absence of one -- see
+ * Authorization::_hasNoPrincipal() for what it licenses and why the
+ * distinction matters.
+ */
+define('FOG_MACHINE_REQUEST', true);
+
 require '../commons/base.inc.php';
 try {
     FOGCore::getHostItem(false);
     $Task = FOGCore::$Host->get('task');
     $TaskType = new TaskType($Task->get('typeID'));
     if (!$Task->isValid()) {
-        throw new Exception(
+        throw new \Exception(
             sprintf(
                 '%s: %s (%s)',
                 _('No Active Task found for Host'),
@@ -36,7 +49,7 @@ try {
     }
     $Image = $Task->getImage();
     if (!$Image->isValid()) {
-        throw new Exception(_('Invalid image'));
+        throw new \Exception(_('Invalid image'));
     }
     $statusRaw = base64_decode(
         (string)
@@ -48,19 +61,20 @@ try {
         true
     );
     if (false === $statusRaw) {
-        throw new Exception(_('Invalid status payload'));
+        throw new \Exception(_('Invalid status payload'));
     }
     $imagingTasks = $TaskType->isImagingTask();
     if ($imagingTasks) {
         $str = explode('@', $statusRaw);
-        if (isset($str)
-            && isset($str[0])
+        $strArrsSet = (
+            isset($str[0])
             && isset($str[1])
             && isset($str[2])
             && isset($str[3])
             && isset($str[4])
             && isset($str[5])
-        ) {
+        );
+        if ($strArrsSet) {
             $Task->set('bpm', (float)$str[0])
                 ->set('timeElapsed', strip_tags($str[1]))
                 ->set('timeRemaining', strip_tags($str[2]))
@@ -70,10 +84,14 @@ try {
                 ->set('pct', max(0, min(100, (float)$str[5])))
                 ->save();
         }
-        if (!isset($str[6]) || empty(trim($str[6])) || !$Task->isCapture()) {
-            exit;
+        if (isset($str[6])) {
+            $str[6] = trim($str[6]);
+        } else {
+            $str[6] = '';
         }
-        $str[6] = trim($str[6]);
+        if (empty($str[6]) || !$Task->isCapture()) {
+            return;
+        }
         if (strpos($Image->get('size'), $str[6]) !== false) {
             return;
         }
@@ -86,7 +104,7 @@ try {
             )
         )->save();
     }
-} catch (Exception $e) {
+} catch (\Exception $e) {
     echo Initiator::e($e->getMessage());
 }
 exit;

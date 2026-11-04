@@ -10,6 +10,12 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Db\DatabaseManager;
+use FOG\Items\Schema;
+use FOG\Router\HTTPResponseCodes;
+
 /**
  * Checks the database is running
  *
@@ -20,19 +26,19 @@
  * @link     https://fogproject.org
  */
 require '../commons/base.inc.php';
-session_write_close();
+header('Content-type: application/json');
 ignore_user_abort(true);
 set_time_limit(0);
 $link = DatabaseManager::getLink();
 $redirect = false;
 if ($link) {
-    $redirect = FOGCore::getClass('Schema', 1)
+    $redirect = (new Schema(1))
         ->get('version') == FOG_SCHEMA;
 }
-$ret = array(
+$ret = [
     'running' => (bool)$link,
     'redirect' => (bool)$redirect,
-);
+];
 /**
  * When the database is unreachable, expose the underlying connection error
  * (e.g. SQLSTATE[HY000] [2002] Permission denied) so the cause is diagnosable.
@@ -43,6 +49,11 @@ $ret = array(
 if (!$link) {
     $ret['error'] = DatabaseManager::getDB()->connectError();
 }
+http_response_code(
+    $ret['running'] ?
+    HTTPResponseCodes::HTTP_SUCCESS :
+    HTTPResponseCodes::HTTP_INTERNAL_SERVER_ERROR
+);
 $ret = json_encode($ret);
 echo $ret;
 exit;

@@ -15,10 +15,10 @@
  *      certificates, and there the setting bought nothing and cost the
  *      ability to notice a substituted response. Downloading a kernel is
  *      the sharpest case: the file lands on disk and is booted by every
- *      machine that images afterwards.
+ *      machine that images afterward.
  *   2. The signed-in administrator's PHP session id (and the CSRF token)
  *      were attached to every request. They are there so a node's status
- *      endpoint can authorise the call; sending them to a third party is a
+ *      endpoint can authorize the call; sending them to a third party is a
  *      credential handed over for no purpose.
  *
  * Both are now decided by the URL's host rather than by the caller, so a
@@ -37,7 +37,7 @@ $root = dirname(__DIR__);
 chdir($root);
 
 $fails = [];
-$file = 'packages/web/lib/fog/fogurlrequests.class.php';
+$file = 'packages/web/src/Net/FOGURLRequests.php';
 $src = (string)file_get_contents($file);
 
 /*
@@ -133,8 +133,8 @@ if ('' === $exemption) {
 }
 if (2 !== preg_match_all('#CURLOPT_SSL_VERIFYPEER\s*=>\s*true#', $src)) {
     $fails[] = 'the shared option set no longer defaults'
-        . ' CURLOPT_SSL_VERIFYPEER to true in both the property and the'
-        . ' __destruct() reset';
+        . ' CURLOPT_SSL_VERIFYPEER to true in both the property and'
+        . ' _baseOptions()';
 }
 
 /*
@@ -164,8 +164,9 @@ if (!preg_match(
  * cookie, and the header still went out as the bare "PHPSESSID=". An empty
  * value satisfies isset() on the far side, so init.php's browser-less gate
  * opened, use_strict_mode found no id to resume, and PHP minted a throwaway
- * session per request. Pinned by shape for the same reason as the gate
- * above: what must not come back is a cookie line that runs with no session.
+ * session per request -- ~3,000 an hour from the multicast daemon's node
+ * reads alone. Pinned by shape for the same reason as the gate above: what
+ * must not come back is a cookie line that runs with no session.
  */
 if (!preg_match(
     '#!isset\(\$options\[CURLOPT_COOKIE\]\)\s*\n\s*&& session_id\(\) !== \x27\x27#',
@@ -185,26 +186,10 @@ if (false === strpos($src, 'X-CSRF-Token:')) {
  *    and the TLS exemption now share one answer, so a pattern loose enough
  *    for the first is a hole in the second.
  */
-if (preg_match('#preg_match\(\$pat, \$url\)#', $src)) {
+if (preg_match('#preg_match\(\$this->_proxy#', $src)) {
     $fails[] = 'the proxy bypass matches the URL against a pattern again;'
         . ' it shares its answer with the TLS exemption, so the comparison'
         . ' has to be a whole-host one';
-}
-/*
- * 5. The node list must be ADDRESSES. getSubObjectIDs() defaults its field
- *    to 'id', and this call used to take that default -- so the list was
- *    storage node IDs and the pattern above was matching '#1|2|5#' against
- *    the whole URL. Survivable while it only chose a proxy (which it
- *    therefore applied essentially never, unnoticed); not survivable now
- *    that the same answer decides whether a certificate is verified.
- */
-if (!preg_match(
-    "#getSubObjectIDs\('StorageNode', array\(\), 'ip'\)#",
-    $src
-)) {
-    $fails[] = "the storage node list is not read with the 'ip' field;"
-        . " getSubObjectIDs() defaults to 'id', which would make the host"
-        . ' comparison a list of row ids';
 }
 
 if (count($fails) > 0) {

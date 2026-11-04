@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Util\FOGLogPaths;
+
 /**
  * Logtoview handles reading files
  *
@@ -20,7 +24,6 @@
  * @link     https://fogproject.org
  */
 require_once '../commons/base.inc.php';
-session_write_close();
 ignore_user_abort(true);
 set_time_limit(0);
 header('Content-Type: text/event-stream');
@@ -40,6 +43,41 @@ if (!(isset($_POST['file'])
 }
 $file = '';
 $lines = '';
+/**
+ * Re-labels FOG's own service-log timestamps into the viewer's display zone.
+ *
+ * FOG's service logs (Scheduler, Multicast, Image Replicator, ...) stamp
+ * every line via Service_Log_message(), which has no signed-in viewer to
+ * convert for and so always writes in the storage zone -- UTC once the
+ * storage boundary is crossed. This re-parses that exact stamp in the same
+ * zone it was written, then shows it in the requesting viewer's own display
+ * zone, same as every other date in the UI. A line that doesn't match
+ * (Apache, nginx, syslog, ...) is left untouched -- their own software chose
+ * whatever zone they carry, and this cannot know it.
+ *
+ * @param string $output raw log text, possibly spanning many lines.
+ *
+ * @return string
+ */
+function convertServiceLogTimestamps($output)
+{
+    return preg_replace_callback(
+        '/^\[(\d{2}-\d{2}-\d{2} \d{1,2}:\d{2}:\d{2} [ap]m)\]/m',
+        function ($matches) {
+            $stamp = \DateTime::createFromFormat(
+                'm-d-y g:i:s a',
+                $matches[1],
+                FOGCore::storageTimeZone()
+            );
+            if (!$stamp) {
+                return $matches[0];
+            }
+            $stamp->setTimezone(FOGCore::displayTimeZone());
+            return '['.$stamp->format('m-d-y g:i:s a').']';
+        },
+        $output
+    );
+}
 /**
  * Returns vals.
  *
@@ -66,30 +104,20 @@ function vals($reverse, $HookManager, $lines, $file)
         '#^%s$#',
         $folder
     );
-    // Anchored and exact against the requested file's dirname, so every
-    // path needs its trailing separator and BOTH spellings of FOG's log
-    // directory -- the viewer reaches a file through the symlink while
-    // /opt/fog/log is the real path. Keep in step with the two enumeration
-    // lists; see the note in StorageNode::_getData().
-    $folders = array(
-        '/var/log/fog/',
-        '/var/log/fog/fos/',
-        // FOGBase::logFault()'s, both spellings. This list is matched
-        // ANCHORED and EXACT against a requested file's dirname, so the
-        // trailing separator is not decoration.
-        '/var/log/fog/faults/',
-        '/opt/fog/log/',
-        '/opt/fog/log/fos/',
-        '/opt/fog/log/faults/',
-        '/var/log/httpd/',
-        '/var/log/apache2/',
-        '/var/log/nginx/',
-        '/var/log/php-fpm/',
-        '/var/log/php5.6-fpm/',
-        '/var/log/php5-fpm/',
-        '/var/log/php7.0-fpm/'
+    // The reader's view of FOGLogPaths: separator-terminated and wildcard
+    // free, because the pattern above is anchored -- so a subdirectory is NOT
+    // covered by its parent being listed, and each has to appear in its own
+    // right. This shares source data with the enumeration sites but not the
+    // matching: theirs compiles the requested path as an unanchored regex,
+    // and this is an authorization list.
+    //
+    // A plugin shipping a log outside these should add its folder through the
+    // LOG_FOLDERS hook below rather than by editing FOGLogPaths.
+    $folders = FOGLogPaths::readable();
+    $HookManager->processEvent(
+        'LOG_FOLDERS',
+        ['folders' => &$folders]
     );
-    $HookManager->processEvent('LOG_FOLDERS', array('folders'=>&$folders));
     if (!preg_grep($pattern, $folders)) {
         return _('Invalid Folder');
     }
@@ -124,6 +152,7 @@ function vals($reverse, $HookManager, $lines, $file)
         );
     }
     fclose($fh);
+    $output = convertServiceLogTimestamps($output);
     if ($reverse) {
         $output = implode(
             "\n",
@@ -137,44 +166,57 @@ function vals($reverse, $HookManager, $lines, $file)
     }
     return trim(htmlspecialchars($output));
 }
+
 if (!(isset($_POST['ip'])
     && is_string($_POST['ip']))
 ) {
     echo _('Invalid IP');
     exit;
 }
+$ip = filter_input(INPUT_POST, 'ip');
 if (!(isset($_POST['file'])
     && is_string($_POST['file']))
 ) {
     echo _('Invalid File');
     exit;
 }
+$file = filter_input(INPUT_POST, 'file');
 if (!(isset($_POST['lines'])
     && is_numeric($_POST['lines']))
 ) {
-    $_POST['lines'] = 20;
+    $lines = 20;
+} else {
+    $lines = filter_input(INPUT_POST, 'lines');
 }
 if (!(isset($_POST['reverse'])
     && is_numeric($_POST['reverse']))
 ) {
-    $_POST['reverse'] = 0;
+    $reverse = 0;
+} else {
+    $reverse = filter_input(INPUT_POST, 'reverse');
 }
-$ip = $_POST['ip'];
 $file = sprintf(
     '%s%s%s',
-    dirname($_POST['file']),
+    dirname($file),
     DS,
-    basename($_POST['file'])
+    basename($file)
 );
-$lines = $_POST['lines'];
-$reverse = $_POST['reverse'];
 $ip = base64_decode($ip);
 $ip = FOGCore::resolveHostname($ip);
 $ip = trim($ip);
 if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
     return print json_encode(_('IP Passed is incorrect'));
 }
-if (false !== strpos((string)filter_input(INPUT_SERVER, 'HTTP_HOST'), $ip)) {
+// Which storage node am I? Compare against SERVER_ADDR (the socket this
+// request actually landed on), not the client's Host header -- Host is
+// whatever name/alias the browser typed (a hostname behind OIDC, a load
+// balancer, an /etc/hosts alias), and almost never equals this node's own
+// IP as a substring. That mismatch always fell through to the "remote
+// node" branch below, which self-proxies over HTTP with no session --
+// so even the master's own logs went through an unauthenticated request
+// to itself and got rejected. SERVER_ADDR is set by the web server from
+// the actual connection, independent of how the client addressed us.
+if ($ip === filter_input(INPUT_SERVER, 'SERVER_ADDR')) {
     $str = vals(
         $reverse,
         $HookManager,
@@ -189,12 +231,12 @@ $url = sprintf(
     FOGCore::$httpproto,
     $ip
 );
-$process = array(
+$process = [
     'ip' => base64_encode($ip),
     'file' => $file,
     'lines' => $lines,
     'reverse' => $reverse
-);
+];
 $response = $FOGURLRequests->process(
     $url,
     'POST',

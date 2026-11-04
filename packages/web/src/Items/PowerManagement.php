@@ -1,0 +1,165 @@
+<?php
+/**
+ * PowerManagement class handler
+ *
+ * PHP version 7.4+
+ *
+ * @category PowerManagement
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+
+namespace FOG\Items;
+
+use FOG\Base\FOGController;
+use FOG\Util\Timer;
+
+/**
+ * PowerManagement class handler
+ *
+ * @category PowerManagement
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+class PowerManagement extends FOGController
+{
+    /**
+     * The database table to work from
+     *
+     * @var string
+     */
+    protected $databaseTable = 'powerManagement';
+    /**
+     * The fields and common name associations
+     *
+     * @var array
+     */
+    protected $databaseFields = [
+        'id' => 'pmID',
+        'hostID' => 'pmHostID',
+        'min' => 'pmMin',
+        'hour' => 'pmHour',
+        'dom' => 'pmDom',
+        'month' => 'pmMonth',
+        'dow' => 'pmDow',
+        'onDemand' => 'pmOndemand',
+        'action' => 'pmAction'
+    ];
+    /**
+     * The required fields
+     *
+     * @var array
+     */
+    protected $databaseFieldsRequired = [
+        'hostID',
+        'action'
+    ];
+    /**
+     * Any additional fields
+     *
+     * @var array
+     */
+    protected $additionalFields = [
+        'hosts'
+    ];
+    /**
+     * Add new hosts to the powermanagement system
+     *
+     * @param array $addArray the hosts to add
+     *
+     * @return object
+     */
+    public function addHost($addArray)
+    {
+        return $this->addRemItem('hosts', (array)$addArray, 'merge');
+    }
+    /**
+     * Removes hosts from the powermanagement system
+     *
+     * @param array $removeArray the hosts to remove
+     *
+     * @return object
+     */
+    public function removeHost($removeArray)
+    {
+        return $this->addRemItem('hosts', (array)$removeArray, 'diff');
+    }
+    /**
+     * Loads an hosts for this pm tasking
+     *
+     * @return void
+     */
+    protected function loadHosts()
+    {
+        $this->_loadHostIds(
+            'powermanagement',
+            ['id' => $this->get('id')],
+            'hostID'
+        );
+    }
+    /**
+     * Saves the item to the db
+     *
+     * @return object
+     */
+    public function save()
+    {
+        // Propagate a failed write rather than reporting success; the
+        // association work below has no row to attach to either. See
+        // tests/save-propagates-failure.test.php.
+        if (!parent::save()) {
+            return false;
+        }
+        return $this
+            ->assocSetter('PowerManagement', 'host', true)
+            ->load();
+    }
+    /**
+     * Gets the action as defined
+     *
+     * @return string
+     */
+    public function getActionSelect()
+    {
+        return $this->getManager()->getActionSelect(
+            $this->get('action'),
+            true
+        );
+    }
+    /**
+     * Gets the current timer for this pm task
+     *
+     * @return object
+     */
+    public function getTimer()
+    {
+        $min = trim($this->get('min'));
+        $hour = trim($this->get('hour'));
+        $dom = trim($this->get('dom'));
+        $month = trim($this->get('month'));
+        $dow = trim($this->get('dow'));
+        return new Timer($min, $hour, $dom, $month, $dow);
+    }
+    /**
+     * Returns the host associated to this pm task
+     *
+     * @return object
+     */
+    public function getHost()
+    {
+        return new Host($this->get('hostID'));
+    }
+    /**
+     * Wakes the host mac
+     *
+     * @return void
+     */
+    public function wakeOnLAN()
+    {
+        $this->getHost()->wakeOnLAN();
+    }
+}

@@ -13,6 +13,9 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+
 /**
  * Gets bandwidth usage of requested interface
  *
@@ -23,6 +26,13 @@
  * @link     https://fogproject.org
  */
 header('Content-Type: application/json');
+function read_return_int($filename)
+{
+    if (!file_exists($filename)) {
+        return 0;
+    }
+    return (int)trim(file_get_contents($filename));
+}
 /**
  * Lambda for returning the bytes from the file requested.
  *
@@ -37,12 +47,12 @@ header('Content-Type: application/json');
  */
 $getBytes = function ($dev) {
     if (!is_string($dev)) {
-        throw new Exception(_('Device must be a string'));
+        throw new \Exception(_('Device must be a string'));
     }
     $txpath = "/sys/class/net/$dev/statistics/tx_bytes";
     $rxpath = "/sys/class/net/$dev/statistics/rx_bytes";
-    $tx = trim(file_get_contents($txpath));
-    $rx = trim(file_get_contents($rxpath));
+    $tx = read_return_int($txpath);
+    $rx = read_return_int($rxpath);
     return [$rx,$tx];
 };
 // Make sure a device is set
@@ -65,24 +75,23 @@ $dir_interfaces = array_diff(
 // Initiate our interfaces variable
 $interfaces = [];
 // Loop the captured data and set up interfaces
-foreach ($dir_interfaces as &$iface) {
+foreach ($dir_interfaces as $iface) {
     $operstateFile = "/sys/class/net/$iface/operstate";
-    if (file_exists($operstateFile)) {
-        $content = file_get_contents($operstateFile);
-        $content = trim($content);
-        if ($content !== 'up') {
-            continue;
-        }
-        $interfaces[] = $iface;
+    if (!file_exists($operstateFile)) {
+        continue;
     }
-    unset($iface);
+    $content = file_get_contents($operstateFile);
+    $content = trim($content);
+    if ($content !== 'up') {
+        continue;
+    }
+    $interfaces[] = $iface;
 };
 // Check up interfaces to see if our specified device is present
 $interface = preg_grep("#^$dev$#", $interfaces);
 // If our interface isn't found, try getting it directly off the system
 if (count($interface) < 1) {
     include '../commons/base.inc.php';
-    session_write_close();
     ignore_user_abort(true);
     set_time_limit(0);
     FOGCore::checkAuthAndCSRF();
@@ -109,13 +118,13 @@ if (!$dev) {
 list($rxlast, $txlast) = $getBytes($dev);
 usleep(100000);
 list($rxcur, $txcur) = $getBytes($dev);
-$rx = round(ceil((int)(($rxcur - $rxlast)) / 1024 * 8 / 100), 2);
-$tx = round(ceil((int)(($txcur - $txlast)) / 1024 * 8 / 100), 2);
+$rx = round(ceil(($rxcur - $rxlast) / 1024 * 8 / 100), 2);
+$tx = round(ceil(($txcur - $txlast) / 1024 * 8 / 100), 2);
 // Setup our return array
 $ret = [
     'dev' => $dev,
-    'rx' => $rx,
-    'tx' => $tx,
+    'rx' => (int)$rx,
+    'tx' => (int)$tx,
 ];
 // Return
 echo json_encode($ret);

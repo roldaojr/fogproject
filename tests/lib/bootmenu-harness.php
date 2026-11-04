@@ -1,51 +1,60 @@
 <?php
 /**
- * A stub FOG runtime just large enough to render BootMenu's iPXE output.
+ * A stub FOG runtime just large enough to render IpxeBootMenu's iPXE output.
  *
- * BootMenu extends FOGBase and reaches the database only through a handful
- * of static helpers, so replacing FOGBase replaces the entire world it can
- * see. Nothing here talks to MySQL, the network, or the filesystem outside
+ * IpxeBootMenu extends FOGBase and reaches storage only through FOGBase's statics
+ * and the Route facade, so replacing those two replaces the entire world it
+ * can see. Nothing here talks to MySQL, the network, or the filesystem outside
  * a caller-supplied BASEPATH, which is what lets the boot menu be rendered
  * byte-for-byte in a test.
  *
  * Fidelity notes -- these are the places where a lazy stub would silently
  * produce the wrong golden file:
  *
- * 1. getSubObjectIDs('Service', ['name' => [...]], 'value', ..., 'name', ...)
- *    returns setting VALUES ORDERED BY SETTING NAME, not in the order the
- *    caller listed them. BootMenu destructures the result positionally with
- *    list(), so the sort is load-bearing: it is the reason $serviceNames and
- *    $ipxeGrabs are written in alphabetical order. The stub sorts the same
- *    way, and throws on an unknown key rather than returning a short array,
- *    because a missing row shifts every subsequent variable by one and would
+ * 1. getSetting() has two shapes. A string key returns one value or null; an
+ *    array of keys returns one entry per key IN THE ORDER ASKED FOR, null for
+ *    a row that does not exist. IpxeBootMenu destructures the array form
+ *    positionally with list(), so both the ordering and the never-skip rule
+ *    are load-bearing. The stub reproduces them, and additionally throws on a
+ *    key with no fixture: silently returning null for an unknown setting would
  *    bake a plausible-looking but wrong golden file.
- * 2. fastmerge() and arrayInsertAfter() are copied verbatim from
- *    FOGBase rather than reimplemented -- fastmerge's numeric-vs-string key
- *    handling decides menu line ordering.
- * 3. resolveHostname() never does DNS. A test that resolves a name is a test
+ * 2. Route::getList() hands back objects with PUBLIC PROPERTIES ($Menu->name,
+ *    $StorageNode->ip), not get()-style models. RouteItem below is that shape;
+ *    using a get() model instead would fatal inside _menuItem().
+ * 3. fastmerge() and arrayInsertAfter() are copied verbatim from FOGBase --
+ *    fastmerge's numeric-vs-string key handling decides menu line ordering.
+ * 4. resolveHostname() never does DNS. A test that resolves a name is a test
  *    that fails on an airplane.
  *
+ * Everything lives in namespace FOG because bootmenu.class.php does; the
+ * class_alias at the foot of that file then re-exports IpxeBootMenu globally
+ * exactly as it does in production.
+ *
  * Not a mock framework by design: the house style is a plain PHP script with
- * an exit status, runnable from the pre-commit hook.
+ * an exit status, discovered by tests/run-all.sh.
  */
+
+namespace FOG;
+
+// The one real class the menu needs (#198). It is pure -- no base class,
+// no globals, no database -- so the real file loads where everything else
+// here is a stub. The stubbed FOGBase is untouched by it.
+require_once dirname(__DIR__, 2) . '/packages/web/src/Base/SmbiosIdentity.php';
 
 if (!defined('DS')) {
     define('DS', DIRECTORY_SEPARATOR);
 }
 
-if (!function_exists('_')) {
-    /**
-     * gettext stand-in; the real one is unavailable without the web bootstrap.
-     *
-     * @param string $string the string to translate
-     *
-     * @return string
-     */
-    function _($string)
-    {
-        return $string;
-    }
-}
+/*
+ * Route rows are plain stdClass objects, created with (object)[...].
+ *
+ * Not a class with __get: IpxeBootMenu::generateIpxeItems() builds its iPXE
+ * output by iterating the row -- foreach ($object as $property => $value) --
+ * which only sees genuinely public properties. A row backed by a private
+ * array with an accessor iterates as empty, so every `set hostname ...` line
+ * would silently vanish from the golden file and the host-info block would
+ * look correctly empty rather than broken.
+ */
 
 /**
  * Generic record stub standing in for a FOGController model.
@@ -57,19 +66,24 @@ class StubModel
      *
      * @var array
      */
-    protected $data = array();
+    protected $data = [];
     /**
      * Instantiates the record.
      *
-     * @param array $data the field data
+     * Deliberately untyped. FOGController accepts either an id or a field
+     * array, and callers now reach these stubs through a plain `new` rather
+     * than through the harness's getClass() switch, which used to do the
+     * `(array)` cast on the way past. Doing it here keeps what the switch
+     * produced rather than making every call site match the stub.
+     *
+     * @param mixed $data the field data, or the id
      */
-    public function __construct(array $data = array())
+    public function __construct($data = [])
     {
-        $this->data = $data;
+        $this->data = (array)$data;
     }
     /**
-     * A record is valid when it carries a non-zero id, matching
-     * FOGController's own notion of validity closely enough for rendering.
+     * A record is valid when it carries a non-zero id.
      *
      * @return bool
      */
@@ -122,15 +136,26 @@ class StubModel
     {
         return true;
     }
+    /**
+     * Property reads mirror get(), because 1.6 code freely uses both.
+     *
+     * @param string $name the field
+     *
+     * @return mixed
+     */
+    public function __get($name)
+    {
+        return $this->get($name);
+    }
 }
 
 /**
- * MAC list stub. BootMenu stringifies this in _ipxeLog().
+ * MAC list stub. IpxeBootMenu stringifies this when logging the request.
  */
 class StubMac extends StubModel
 {
     /**
-     * Renders the MAC as BootMenu expects.
+     * Renders the MAC as IpxeBootMenu expects.
      *
      * @return string
      */
@@ -164,31 +189,257 @@ class StubTask extends StubModel
     {
         return (bool)$this->get('snapin');
     }
-}
-
-/**
- * Storage node stub.
- */
-class StubStorageNode extends StubModel
-{
     /**
-     * Returns the owning group.
+     * Whether the task itself is a capture.
      *
-     * @return StubModel
+     * Separate from TaskType::isCapture() on purpose -- getTasking() consults
+     * both, and a scenario needs to be able to disagree between them to reach
+     * the getMasterStorageNode() branch.
+     *
+     * @return bool
      */
-    public function getStorageGroup()
+    public function isCapture()
     {
-        return new StubModel(array('id' => 1, 'name' => 'default'));
+        return (bool)$this->get('capture');
+    }
+    /**
+     * Returns the task's type.
+     *
+     * @return TaskType
+     */
+    public function getTaskType()
+    {
+        return new TaskType((array)($this->data['tasktype'] ?? []));
+    }
+    /**
+     * Returns the image being deployed or captured.
+     *
+     * @return Image
+     */
+    public function getImage()
+    {
+        return new Image((array)($this->data['image'] ?? []));
     }
 }
 
 /**
- * Host stub, with the nested objects BootMenu reaches through.
+ * Task type stub.
+ *
+ * The four is*() predicates are what steer getTasking(): whether an init is
+ * needed at all, whether a storage node is resolved as master or optimal, and
+ * whether the multicast session lookup runs.
+ */
+class TaskType extends StubModel
+{
+    /**
+     * Whether the type images a disk.
+     *
+     * @return bool
+     */
+    public function isImagingTask()
+    {
+        return (bool)$this->get('imaging');
+    }
+    /**
+     * Whether the type is multicast.
+     *
+     * @return bool
+     */
+    public function isMulticast()
+    {
+        return (bool)$this->get('multicast');
+    }
+    /**
+     * Whether the type needs FOS booted.
+     *
+     * @return bool
+     */
+    public function isInitNeededTasking()
+    {
+        return (bool)$this->get('initneeded');
+    }
+    /**
+     * Whether the type captures rather than deploys.
+     *
+     * @return bool
+     */
+    public function isCapture()
+    {
+        return (bool)$this->get('capture');
+    }
+}
+
+/**
+ * Image stub, with the two type lookups getTasking() chains through.
+ */
+class Image extends StubModel
+{
+    /**
+     * Returns the image type (mps, mpa, n).
+     *
+     * @return StubModel
+     */
+    public function getImageType()
+    {
+        return new StubModel(['id' => 1, 'type' => $this->get('imagetype')]);
+    }
+    /**
+     * Returns the partition type (all, mbr, ...).
+     *
+     * A string, not an object: the real Image::getPartitionType() is
+     * getImagePartitionType()->get('type'), and getTasking() concatenates the
+     * result straight into imgPartitionType=. Returning an object here makes
+     * the render die with "could not be converted to string", which is how
+     * this was found.
+     *
+     * @return string
+     */
+    public function getPartitionType()
+    {
+        return (string)$this->get('partitiontype');
+    }
+    /**
+     * Returns the group a deploy reads from.
+     *
+     * @return StorageGroup
+     */
+    public function getStorageGroup()
+    {
+        return new StorageGroup(['id' => 1, 'name' => 'default']);
+    }
+    /**
+     * Returns the group a capture writes to.
+     *
+     * @return StorageGroup
+     */
+    public function getPrimaryStorageGroup()
+    {
+        return new StorageGroup(['id' => 1, 'name' => 'default', 'primary' => true]);
+    }
+}
+
+/**
+ * Storage group stub.
+ *
+ * Both getters return the same node deliberately: which one getTasking()
+ * calls is the behavior under test, and the golden shows it through the
+ * storage= argument rather than through the node's identity.
+ */
+/**
+ * The unlock key sequence a menu offers.
+ *
+ * Carried the harness's getClass() switch until IpxeBootMenu stopped going
+ * through it; the field values are that arm's, unchanged, because the golden
+ * file records the ascii code this emits.
+ */
+class KeySequence extends StubModel
+{
+    /**
+     * Instantiates the sequence.
+     *
+     * @param string $seq the configured sequence name
+     */
+    public function __construct($seq = '')
+    {
+        $seq = trim((string)$seq);
+        parent::__construct(
+            '' === $seq
+                ? []
+                : ['id' => 1, 'ascii' => '0x1b', 'name' => $seq]
+        );
+    }
+}
+/**
+ * A custom iPXE record, looked up by id.
+ *
+ * Same provenance as KeySequence above: this is the getClass() switch's arm
+ * as a class, so stub-buckets.php can alias it to FOG\Items\Ipxe.
+ */
+class Ipxe extends StubModel
+{
+    /**
+     * Instantiates the record.
+     *
+     * @param int $id the record id
+     */
+    public function __construct($id = 0)
+    {
+        parent::__construct(['id' => (int)$id]);
+    }
+}
+class StorageGroup extends StubModel
+{
+    /**
+     * The node a deploy reads from.
+     *
+     * @return StorageNode
+     */
+    public function getOptimalStorageNode()
+    {
+        return new StorageNode(1);
+    }
+    /**
+     * The node a capture writes to.
+     *
+     * @return StorageNode
+     */
+    public function getMasterStorageNode()
+    {
+        return new StorageNode(1);
+    }
+}
+
+/**
+ * Multicast session stub.
+ */
+class MulticastSession extends StubModel
+{
+}
+
+/**
+ * Multicast session association stub, looked up by id from the fixture rows.
+ */
+class MulticastSessionAssociation extends StubModel
+{
+    /**
+     * Looks the association up by id.
+     *
+     * @param int $id the association id
+     */
+    public function __construct($id = 0)
+    {
+        $found = [];
+        foreach ((array)(Route::$rows['multicastsessionassociation'] ?? []) as $assoc) {
+            if (($assoc->id ?? null) == $id) {
+                $found = (array)$assoc;
+                break;
+            }
+        }
+        parent::__construct($found);
+    }
+    /**
+     * Returns the session this association points at.
+     *
+     * @return MulticastSession
+     */
+    public function getMulticastSession()
+    {
+        return new MulticastSession(
+            [
+                'id' => $this->get('msID'),
+                'image' => $this->get('image'),
+            ]
+        );
+    }
+}
+
+/**
+ * Host stub, with the nested objects IpxeBootMenu reaches through.
  */
 class StubHost extends StubModel
 {
     /**
-     * Reads a field, materialising the nested objects BootMenu expects.
+     * Reads a field, materialising the nested objects IpxeBootMenu expects.
      *
      * @param string $key the field to read
      *
@@ -199,17 +450,17 @@ class StubHost extends StubModel
         switch ($key) {
             case 'mac':
                 return new StubMac(
-                    array(
+                    [
                         'id' => 1,
                         'mac' => $this->data['mac'] ?? '00:11:22:33:44:55',
                         'ignored' => $this->data['imageignored'] ?? false,
-                    )
+                    ]
                 );
             case 'task':
-                return new StubTask((array)($this->data['task'] ?? array()));
+                return new StubTask((array)($this->data['task'] ?? []));
             case 'inventory':
                 return new StubModel(
-                    array('id' => 1, 'sysuuid' => $this->data['sysuuid'] ?? '')
+                    ['id' => 1, 'sysuuid' => $this->data['sysuuid'] ?? '']
                 );
         }
         return parent::get($key);
@@ -221,102 +472,54 @@ class StubHost extends StubModel
      */
     public function getImage()
     {
-        return new StubModel((array)($this->data['image'] ?? array()));
-    }
-}
-
-/**
- * Collection stub returned by the *Manager classes.
- */
-class StubManager
-{
-    /**
-     * The records this manager hands back.
-     *
-     * @var array
-     */
-    private $_rows = array();
-    /**
-     * Instantiates the manager.
-     *
-     * @param array $rows the records to serve
-     */
-    public function __construct(array $rows = array())
-    {
-        $this->_rows = $rows;
+        return new StubModel((array)($this->data['image'] ?? []));
     }
     /**
-     * Filters the records the way FOGManagerController::find() would for the
-     * equality-on-a-field cases BootMenu actually uses. A filter value that
-     * is an array means "field IN (...)".
+     * Every MAC on the host.
      *
-     * @param mixed  $findWhere the filter
-     * @param string $whereOp   unused; kept for signature parity
-     * @param string $orderBy   field to sort by
+     * Read on the tasking path only, where it becomes the mac= kernel
+     * argument. Defaults to the host's primary so a scenario that does not
+     * care about multi-NIC still renders.
      *
      * @return array
      */
-    public function find($findWhere = array(), $whereOp = '', $orderBy = '')
+    public function getMyMacs()
     {
-        $rows = $this->_rows;
-        foreach ((array)$findWhere as $field => $want) {
-            $rows = array_values(
-                array_filter(
-                    $rows,
-                    function ($row) use ($field, $want) {
-                        $have = $row->get($field);
-                        if (is_array($want)) {
-                            return in_array($have, $want);
-                        }
-                        return $have == $want;
-                    }
-                )
-            );
-        }
-        if ($orderBy) {
-            usort(
-                $rows,
-                function ($a, $b) use ($orderBy) {
-                    return $a->get($orderBy) <=> $b->get($orderBy);
-                }
-            );
-        }
-        return $rows;
+        return (array)($this->data['macs']
+            ?? [$this->data['mac'] ?? '00:11:22:33:44:55']);
     }
 }
 
 /**
- * Hook manager stub. Fires nothing, so the golden output is the
- * plugin-free baseline, and records what was fired so a test can assert
- * the integration points still exist.
+ * Hook manager stub.
  *
- * It can also act as a plugin: `mutate` maps an event name to argument
- * overrides, applied on fire. BOOT_ITEM_NEW_SETTINGS is built with reference
- * elements (array('initrd' => &$initrd)), so writing to the argument array
- * here writes through to the caller's variable -- exactly the mechanism a
- * real plugin uses, and the only way to test whether a plugin's value
- * actually survives.
+ * Records every event, and can act as a plugin: `mutate` maps an event name
+ * to argument overrides, applied on fire. Because BOOT_ITEM_NEW_SETTINGS is
+ * built with reference elements (['initrd' => &$initrd]), writing to the
+ * argument array here writes through to the caller's variable -- which is
+ * exactly the mechanism a real plugin uses, and the only way to test whether
+ * a plugin's value actually survives.
  */
 class StubHookManager
 {
     /**
-     * Events seen, in order, as event name => argument keys.
+     * Events seen, in order.
      *
      * @var array
      */
-    public $fired = array();
+    public $fired = [];
     /**
-     * Event name => array(argument => replacement value).
+     * Event name => [argument => replacement value].
      *
      * @var array
      */
-    public $mutate = array();
+    public $mutate = [];
     /**
      * Instantiates the manager.
      *
      * @param array $mutate the plugin-like overrides to apply
      */
-    public function __construct(array $mutate = array())
+    public function __construct(array $mutate = [])
     {
         $this->mutate = $mutate;
     }
@@ -328,23 +531,20 @@ class StubHookManager
      *
      * @return void
      */
-    public function processEvent($event, $arguments = array())
+    public function processEvent($event, $arguments = [])
     {
-        $scalars = array();
+        $scalars = [];
         foreach ((array)$arguments as $key => $value) {
             if (null === $value || is_scalar($value)) {
                 $scalars[$key] = $value;
             }
         }
-        $this->fired[] = array(
+        $this->fired[] = [
             'event' => $event,
             'args' => array_keys((array)$arguments),
             'scalars' => $scalars,
-        );
-        $mutations = isset($this->mutate[$event])
-            ? $this->mutate[$event]
-            : array();
-        foreach ((array)$mutations as $key => $value) {
+        ];
+        foreach ((array)($this->mutate[$event] ?? []) as $key => $value) {
             if (array_key_exists($key, $arguments)) {
                 $arguments[$key] = $value;
             }
@@ -364,7 +564,134 @@ class StubHookManager
 }
 
 /**
- * The stub FOGBase. BootMenu's entire view of the system is these members.
+ * The stub Route facade.
+ */
+class Route
+{
+    /**
+     * Fixture rows, keyed by the lowercase class name Route is asked for.
+     *
+     * @var array
+     */
+    public static $rows = [];
+    /**
+     * Filters fixture rows the way Route would for the equality-on-a-field
+     * cases IpxeBootMenu uses. An array filter value means "field IN (...)".
+     *
+     * @param string $class     the class to query
+     * @param mixed  $findWhere the filter
+     * @param string $whereOp   unused; signature parity
+     * @param string $orderBy   field to sort by
+     *
+     * @throws \Exception on a class with no fixture
+     * @return array
+     */
+    public static function getList(
+        $class,
+        $findWhere = [],
+        $whereOp = 'AND',
+        $orderBy = ''
+    ) {
+        $class = strtolower($class);
+        if (!array_key_exists($class, self::$rows)) {
+            throw new \Exception("harness: no fixture rows for '$class'");
+        }
+        $rows = self::$rows[$class];
+        foreach ((array)$findWhere as $field => $want) {
+            $rows = array_values(
+                array_filter(
+                    $rows,
+                    function ($row) use ($field, $want) {
+                        $have = $row->{$field} ?? null;
+                        if (is_array($want)) {
+                            return in_array($have, $want);
+                        }
+                        return $have == $want;
+                    }
+                )
+            );
+        }
+        if ($orderBy) {
+            usort(
+                $rows,
+                function ($a, $b) use ($orderBy) {
+                    return ($a->{$orderBy} ?? null) <=> ($b->{$orderBy} ?? null);
+                }
+            );
+        }
+        return $rows;
+    }
+    /**
+     * Returns the ids of the matching rows.
+     *
+     * @param string $class     the class to query
+     * @param mixed  $findWhere the filter
+     * @param string $getField  the column to return
+     *
+     * @return array
+     */
+    public static function getIds($class, $findWhere = [], $getField = 'id')
+    {
+        return array_map(
+            function ($row) use ($getField) {
+                return $row->{$getField} ?? null;
+            },
+            self::getList($class, $findWhere ?: [])
+        );
+    }
+    /**
+     * Returns one row by id.
+     *
+     * @param string $class the class to query
+     * @param int    $id    the row id
+     *
+     * @return RouteItem|null
+     */
+    public static function getItem($class, $id)
+    {
+        $rows = self::getList($class, ['id' => $id]);
+        return $rows ? $rows[0] : null;
+    }
+    /**
+     * Field names IpxeBootMenu must not echo into an iPXE script. Kept small and
+     * real: generateIpxeItems() uses it to decide what to omit.
+     *
+     * @return array
+     */
+    public static function sensitiveFieldMap()
+    {
+        /*
+         * Three tiers, each keyed by class name with a list of that class'
+         * field names -- generateIpxeItems() walks it two levels deep
+         * (foreach tier, foreach class => $fields) and array_merges the
+         * innermost lists, so a flatter stub fatals on array_merge().
+         * Mirrors Route::$sensitiveFields / $sensitiveAlwaysFields /
+         * Redaction::$patternExempt.
+         */
+        return [
+            'fields' => [
+                'host' => [
+                    'ADPass',
+                    'ADPassLegacy',
+                    'productKey',
+                    'pub_key',
+                    'sec_tok',
+                    'prev_sec_tok',
+                    'sec_time',
+                    'token',
+                ],
+            ],
+            'always' => [
+                'storagenode' => ['pass'],
+            ],
+            'exempt' => [],
+        ];
+    }
+}
+
+/**
+ * The stub FOGBase. IpxeBootMenu's entire view of the system is these members
+ * plus Route.
  */
 class FOGBase
 {
@@ -387,29 +714,23 @@ class FOGBase
      */
     public static $httpproto = 'http';
     /**
-     * Settings, keyed by name, as the globalSettings table would hold them.
+     * Settings, keyed by name, as globalSettings would hold them.
      *
      * @var array
      */
-    public static $settings = array();
+    public static $settings = [];
     /**
-     * PXE menu rows, as StubModel records.
+     * The MAC addresses the request identified itself with.
+     *
+     * Populated by the real getHostItem() from the mac0/macboot/mac1..mac7
+     * fields the iPXE menu posts. A scenario sets it directly, because
+     * filter_input() reads the SAPI's own request and has nothing to read
+     * under the CLI -- which is also why the boot menu must not go back to
+     * the request for this itself.
      *
      * @var array
      */
-    public static $menus = array();
-    /**
-     * Images, as StubModel records.
-     *
-     * @var array
-     */
-    public static $images = array();
-    /**
-     * Storage nodes, as StubStorageNode records.
-     *
-     * @var array
-     */
-    public static $storagenodes = array();
+    public static $requestMacs = [];
     /**
      * Base constructor; nothing to bootstrap.
      */
@@ -417,90 +738,35 @@ class FOGBase
     {
     }
     /**
-     * Serves the object-id lookups BootMenu performs.
+     * Reads one setting, or several in the order asked for.
      *
-     * Only the shapes BootMenu actually issues are supported; anything else
-     * throws, so a future caller cannot silently receive an empty array and
-     * bake a wrong golden file.
+     * @param string|array $key the setting name(s)
      *
-     * @param string $object    the class to query
-     * @param array  $findWhere the filter
-     * @param string $getField  the field to return
-     *
-     * @throws Exception on an unsupported query or unknown setting
-     * @return array
-     */
-    public static function getSubObjectIDs(
-        $object = 'Host',
-        $findWhere = array(),
-        $getField = 'id',
-        $not = false,
-        $operator = 'AND',
-        $orderBy = 'name',
-        $groupBy = false,
-        $filter = 'array_unique'
-    ) {
-        if ('Service' === $object) {
-            $names = (array)($findWhere['name'] ?? array());
-            /*
-             * The real query orders by setting name and returns values.
-             * BootMenu destructures positionally, so sorting here is what
-             * keeps each value bound to the right variable.
-             */
-            sort($names);
-            $out = array();
-            foreach ($names as $name) {
-                if (!array_key_exists($name, self::$settings)) {
-                    throw new Exception(
-                        "harness: no fixture for setting '$name'; add it, "
-                        . "because a missing row shifts every later list() "
-                        . "variable by one"
-                    );
-                }
-                $out[] = self::$settings[$name];
-            }
-            return $out;
-        }
-        if ('StorageNode' === $object) {
-            $mgr = new StubManager(self::$storagenodes);
-            return array_map(
-                function ($n) {
-                    return $n->get('id');
-                },
-                $mgr->find($findWhere)
-            );
-        }
-        if ('PXEMenuOptions' === $object) {
-            $mgr = new StubManager(self::$menus);
-            return array_map(
-                function ($m) {
-                    return $m->get('id');
-                },
-                $mgr->find($findWhere)
-            );
-        }
-        if ('iPXE' === $object || 'MulticastSessionAssociation' === $object) {
-            return array();
-        }
-        throw new Exception("harness: unsupported getSubObjectIDs('$object')");
-    }
-    /**
-     * Reads a setting.
-     *
-     * @param string $key the setting name
-     *
+     * @throws \Exception on a key with no fixture
      * @return mixed
      */
     public static function getSetting($key)
     {
-        return self::$settings[$key] ?? '';
+        $keys = (array)$key;
+        $out = [];
+        foreach ($keys as $k) {
+            if (!array_key_exists($k, self::$settings)) {
+                throw new \Exception(
+                    "harness: no fixture for setting '$k'; add it, because a "
+                    . "missing row would otherwise render as null and bake a "
+                    . "wrong golden file"
+                );
+            }
+            $out[] = self::$settings[$k];
+        }
+        return is_string($key) ? $out[0] : $out;
     }
     /**
-     * Factory for the classes BootMenu asks for by name.
+     * Factory for the classes IpxeBootMenu asks for by name.
      *
      * @param string $class the class name
      *
-     * @throws Exception on an unsupported class
+     * @throws \Exception on an unsupported class
      * @return mixed
      */
     public static function getClass($class)
@@ -508,28 +774,22 @@ class FOGBase
         $args = func_get_args();
         array_shift($args);
         switch ($class) {
-            case 'PXEMenuOptionsManager':
-                return new StubManager(self::$menus);
-            case 'StorageNodeManager':
-                return new StubManager(self::$storagenodes);
-            case 'ImageManager':
-                return new StubManager(self::$images);
-            case 'MulticastSessionManager':
-                return new StubManager(array());
             case 'KeySequence':
                 $seq = trim((string)($args[0] ?? ''));
                 if ('' === $seq) {
-                    return new StubModel(array());
+                    return new StubModel([]);
                 }
                 return new StubModel(
-                    array('id' => 1, 'ascii' => '0x1b', 'name' => $seq)
+                    ['id' => 1, 'ascii' => '0x1b', 'name' => $seq]
                 );
-            case 'iPXE':
-                return new StubModel(array('id' => (int)($args[0] ?? 0)));
+            case 'Ipxe':
+                return new StubModel(['id' => (int)($args[0] ?? 0)]);
+            case 'StorageNode':
+                return new StorageNode((int)($args[0] ?? 0));
             case 'Image':
-                return new StubModel((array)($args[0] ?? array()));
+                return new StubModel((array)($args[0] ?? []));
         }
-        throw new Exception("harness: unsupported getClass('$class')");
+        throw new \Exception("harness: unsupported getClass('$class')");
     }
     /**
      * Copied verbatim from FOGBase: its numeric-vs-string key handling
@@ -568,7 +828,7 @@ class FOGBase
      * @param string $new_key   the key to add
      * @param mixed  $new_value the value to add
      *
-     * @throws Exception
+     * @throws \Exception
      * @return void
      */
     protected static function arrayInsertAfter(
@@ -578,9 +838,9 @@ class FOGBase
         $new_value
     ) {
         if (!is_string($key) && !is_numeric($key)) {
-            throw new Exception(_('Key must be a string or index'));
+            throw new \Exception('Key must be a string or index');
         }
-        $new = array();
+        $new = [];
         foreach ($array as $k => &$value) {
             $new[$k] = $value;
             if ($k === $key) {
@@ -615,8 +875,7 @@ class FOGBase
         return empty($ids) ? 0 : max($ids);
     }
     /**
-     * Deterministic stand-in: never performs DNS, so the test does not
-     * depend on the resolver.
+     * Deterministic stand-in: never performs DNS.
      *
      * @param string $host the host to resolve
      *
@@ -627,44 +886,115 @@ class FOGBase
         return trim((string)$host);
     }
     /**
-     * Login attempts are not exercised by the rendering scenarios.
+     * Authentication is not exercised by the rendering scenarios.
      *
      * @param string $user the username
      * @param string $pass the password
      *
-     * @return StubModel
+     * @return bool
      */
-    public static function attemptLogin($user, $pass)
+    public static function authenticateOnly($user, $pass)
     {
-        return new StubModel(array());
+        return false;
+    }
+    /**
+     * Task states; only reached on the tasking path.
+     *
+     * @return array
+     */
+    public static function getQueuedStates()
+    {
+        return [1, 2, 3];
+    }
+    /**
+     * Progress state; only reached on the tasking path.
+     *
+     * @return int
+     */
+    public static function getProgressState()
+    {
+        return 3;
+    }
+    /**
+     * Splits a MAC list the way FOGBase does.
+     *
+     * @param string $macs the list to split
+     *
+     * @return array
+     */
+    public static function parseMacList($macs)
+    {
+        return array_values(array_filter(explode('|', (string)$macs)));
+    }
+    /**
+     * Product-key helpers; only reached on the key-registration path.
+     *
+     * @param string $key the key to format
+     *
+     * @return string
+     */
+    public static function productKeyFormat($key)
+    {
+        return (string)$key;
+    }
+    /**
+     * Product-key validity; only reached on the key-registration path.
+     *
+     * @param string $key the key to check
+     *
+     * @return bool
+     */
+    public static function productKeyIsValid($key)
+    {
+        return (bool)$key;
+    }
+    /**
+     * A fixed clock, so a recorded write renders the same bytes every run.
+     *
+     * Reached on the Secure Boot enrollment path, which stamps the date.
+     *
+     * @return \DateTime
+     */
+    public static function niceDate()
+    {
+        return new \DateTime('2026-01-01 00:00:00');
     }
 }
 
 /**
- * Concrete stand-ins for the classes BootMenu instantiates with `new`.
+ * Storage node, looked up by id from the fixture rows.
  */
-class StorageNode extends StubStorageNode
+class StorageNode extends StubModel
 {
     /**
-     * Looks the node up by id from the fixture set.
+     * Looks the node up by id.
      *
      * @param int $id the node id
      */
     public function __construct($id = 0)
     {
-        $found = array();
-        foreach (FOGBase::$storagenodes as $node) {
-            if ($node->get('id') == $id) {
-                $found = $node->get();
+        $found = [];
+        foreach ((array)(Route::$rows['storagenode'] ?? []) as $node) {
+            if (($node->id ?? null) == $id) {
+                $found = (array)$node;
                 break;
             }
         }
         parent::__construct($found);
     }
+    /**
+     * Returns the owning group.
+     *
+     * @return StubModel
+     */
+    public function getStorageGroup()
+    {
+        return new StubModel(['id' => 1, 'name' => 'default']);
+    }
 }
 
 /**
- * PXE menu option, looked up by id from the fixture set.
+ * PXE menu option, looked up by id from the fixture rows.
  */
 class PXEMenuOptions extends StubModel
 {
@@ -675,13 +1005,43 @@ class PXEMenuOptions extends StubModel
      */
     public function __construct($id = 0)
     {
-        $found = array();
-        foreach (FOGBase::$menus as $menu) {
-            if ($menu->get('id') == $id) {
-                $found = $menu->get();
+        $found = [];
+        foreach ((array)(Route::$rows['pxemenuoptions'] ?? []) as $menu) {
+            if (($menu->id ?? null) == $id) {
+                $found = (array)$menu;
                 break;
             }
         }
         parent::__construct($found);
+    }
+}
+
+/**
+ * Host manager. Records each update() instead of writing.
+ *
+ * The render prints what it recorded after the script, so a scenario that
+ * writes the host record shows the write in the golden file.
+ */
+class HostManager
+{
+    /**
+     * Every update() call, in order.
+     *
+     * @var array
+     */
+    public static $updates = [];
+    /**
+     * Records an update.
+     *
+     * @param array  $findWhere the row filter
+     * @param string $whereOp   unused
+     * @param array  $set       the fields written
+     *
+     * @return bool
+     */
+    public function update($findWhere = [], $whereOp = '', $set = [])
+    {
+        self::$updates[] = ['where' => $findWhere, 'set' => $set];
+        return true;
     }
 }

@@ -10,6 +10,10 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+
+use FOG\Base\FOGCore;
+use FOG\Router\Route;
+
 /**
  * Get's size of file passed.
  *
@@ -37,10 +41,8 @@ if (!is_string($file) || !is_file($file) || !is_readable($file)) {
     return 0;
 }
 
-Route::ids('storagenode', [], 'path');
-$imagePaths = json_decode(Route::getData(), true) ?: [];
-Route::ids('storagenode', [], 'snapinpath');
-$snapinPaths = json_decode(Route::getData(), true) ?: [];
+$imagePaths = Route::getIds('storagenode', [], 'path') ?: [];
+$snapinPaths = Route::getIds('storagenode', [], 'snapinpath') ?: [];
 
 $validPaths = array_merge(
     (array)$imagePaths,

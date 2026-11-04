@@ -1,0 +1,39 @@
+#!/usr/bin/php -q
+<?php
+/**
+ * FOGRetentionRunner service to age out the tables that record what happened
+ *
+ * PHP version 5
+ *
+ * @category FOGRetentionRunner
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+
+/**
+ * FOGRetentionRunner service to age out the tables that record what happened
+ *
+ * The sweep used to run inside FOGPluginRunner, which meant an administrator
+ * who switched off a daemon named for plugins also switched off pruning of
+ * the audit trail, the history, the host login records and the task log --
+ * with nothing anywhere to say so. It has its own unit now so that turning
+ * retention off is a deliberate act, and so that "is retention running" is a
+ * question `systemctl status` can answer.
+ *
+ * Like FOGPluginRunner and unlike the other seven this runs as the web user,
+ * not root: it needs a database connection and nothing else. The User=/Group=
+ * lines in the unit file are what enforce that, and installInitScript() fills
+ * them in.
+ *
+ * @category FOGRetentionRunner
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+require dirname(realpath(__FILE__)).'/../etc/config.php';
+require dirname(realpath(__FILE__)).'/../lib/service_lib.php';
+service_persist('FOGRetentionRunner');
+\FOG\Base\FOGCore::getClass('RetentionRunner')->run();

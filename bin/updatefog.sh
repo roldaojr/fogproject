@@ -16,355 +16,381 @@
 #   You should have received a copy of the GNU General Public License
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-# Moves this 1.5 server's checkout onto another FOG line and runs the installer
-# it finds there. Its reason to exist is the 1.5 -> 1.6 crossing, and the
-# channel most people will pass is rc.
+# Moves an existing FOG install's working copy to another commit, then runs the
+# installer against it.
 #
-# WHY THIS IS STANDALONE, AND WILL STAY THAT WAY
+# THAT IS THE WHOLE JOB, and the narrowness is deliberate. This script used to
+# also back up the files installfog.sh's asset sync overwrites, restore them
+# afterward, and git-revert the checkout when the install failed. All of that
+# is gone:
 #
-# The 1.6 line has a bin/updatefog.sh that shares a channel map, a set of
-# managed .fogsettings keys and a pile of helper functions with the rest of the
-# installer. None of that exists on 1.5, and back-porting it would mean surgery
-# on lib/common/functions.sh on a line that is heading for end of life -- every
-# edit of which risks the 1.5 installs it is supposed to help.
+#   * The backup and restore moved INTO installfog.sh -- see
+#     backupPreservedCustomizations/restorePreservedCustomizations in
+#     lib/common/functions.sh. Living here meant a bare `./installfog.sh`
+#     upgrade, which is how most people upgrade, got no protection at all.
 #
-# So this file sources nothing, and duplicates the small amount it needs. It
-# WILL diverge from the 1.6 implementation, and that is fine: this branch is
-# terminal and does not track 1.6's future. What matters is that it can carry
-# a server across, once.
+#   * The automatic revert went with them. installfog.sh now NAMES the commit
+#     to go back to when a run fails (offerRevert) and leaves the decision to
+#     the admin -- reverting meant re-running the installer on a box that had
+#     just failed one, which is the least predictable moment to do the most
+#     invasive thing. bin/restorekernel.sh covers the kernels; bin/revertfog.sh
+#     covers a 1.5 rollback.
 #
-# THE HAZARD THIS SCRIPT IS BUILT AROUND
+#   * Channel persistence moved to installfog.sh's --channel, which this
+#     forwards. Doing it here meant writing .fogsettings BEFORE the checkout so
+#     the child installer would not re-read the old value and write it back --
+#     a sequencing trick that stops being needed once the installer owns the key.
 #
-# It replaces itself. Checking out 1.6 rewrites bin/updatefog.sh underneath a
-# bash process that is still reading it -- bash reads a script incrementally
-# and seeks by byte offset, so a file that changes length mid-run makes it
-# resume in the middle of a different line. The failure is silent, arbitrary,
-# and happens after the checkout has already succeeded.
-#
-# So the first thing this does is copy itself somewhere git will not touch and
-# re-exec from there. Everything after the re-exec is running from a file
-# nothing is going to rewrite. See relaunchFromCopy().
-#
-# Exit codes:
-#   1 not root, or no install found     3 bad argument
-#   6 git failed                        7 no terminal for an interactive install
-
-# Resolved BEFORE the cd, and kept: relaunchFromCopy() reads this path, and $0
-# is whatever the caller typed. Invoked as `bash bin/updatefog.sh` from the
-# checkout root -- or from a cron entry with a relative path -- $0 is
-# `bin/updatefog.sh`, which stops resolving the moment this cd happens, and the
-# copy this script cannot run without would fail.
+# What is left is the one thing installfog.sh genuinely cannot do for itself:
+# change which commit it is about to install.
+# Resolved BEFORE the cd, and kept: the self-copy below reads this path, and
+# $0 is whatever the caller typed. Invoked as `bash bin/updatefog.sh` from the
+# repository root -- or from a cron entry with a relative path -- $0 is
+# `bin/updatefog.sh`, which stops resolving the moment this cd happens.
 selfpath=$(readlink -f "$BASH_SOURCE")
 bindir=$(dirname "$selfpath")
-cd "$bindir"
+cd $bindir
 workingdir=$(pwd)
 
-usage() {
-    echo -e "Usage: $0 [-h?y] [--channel rc|beta|stable|patches] [--branch <name>]"
-    echo -e "\t-h -? --help\t\tDisplay this info"
-    echo -e "\t      --channel\tWhich line to move this server to:"
-    echo -e "\t               \t\t  rc      the current 1.6 release candidate"
-    echo -e "\t               \t\t  beta    the 1.6 development line"
-    echo -e "\t               \t\t  stable  the 1.5 stable line (where you are)"
-    echo -e "\t               \t\t  patches the 1.5 patches line"
-    echo -e "\t               \t\tDefaults to rc"
-    echo -e "\t      --branch\tCheck out a literal branch instead of a channel"
-    echo -e "\t-y    --yes\t\tSkip the confirmation AND run the installer"
-    echo -e "\t               \t\tunattended. NOT recommended for the crossing to"
-    echo -e "\t               \t\t1.6 -- that upgrade asks questions 1.5 never did"
-    echo -e "\n\tGoing from 1.5 to 1.6 is a MAJOR upgrade. Take a backup first."
-    echo -e "\tThe 1.6 tree carries bin/revertfog.sh, which puts a server back on"
-    echo -e "\tits pre-upgrade 1.5 database and web tree from the dump the"
-    echo -e "\tinstaller takes. That dump is the only supported way back."
-    exit 0
-}
-
-fail() {
-    echo
-    echo " * $1"
-    shift
-    while [[ $# -gt 1 ]]; do
-        echo " | $1"
-        shift
-    done
-    echo
-    exit "$1"
-}
-
-# ---------------------------------------------------------------------------
-# Re-exec from a copy, before anything can rewrite this file. See the header.
-#
-# FOG_UPDATE_RELAUNCHED marks the copy so it does not do this again. The copy
-# is removed on exit by the trap below, not here -- it is the file currently
-# being read.
-# ---------------------------------------------------------------------------
-relaunchFromCopy() {
-    local copy
-    copy=$(mktemp -t fog-updatefog.XXXXXX) || return 1
-    cat "$selfpath" > "$copy" || { rm -f "$copy"; return 1; }
-    chmod +x "$copy"
-    FOG_UPDATE_RELAUNCHED=1 FOG_UPDATE_ORIGIN="$workingdir" \
-        FOG_UPDATE_COPY="$copy" exec bash "$copy" "$@"
-}
-
-
-# Kept before the option loop consumes them: the relaunch below re-execs with
-# the ORIGINAL arguments, and by then "$@" has been shifted empty.
-origArgs=("$@")
-
-repo="https://github.com/FOGProject/fogproject.git"
-channel="rc"
-branch=""
-autoYes=""
-sgitpath=""
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h | -\? | --help) usage ;;
-        --channel)
-            [[ -n $2 ]] || fail "--channel requires a value" 3
-            channel="$2"; shift 2 ;;
-        --branch)
-            [[ -n $2 ]] || fail "--branch requires a value" 3
-            branch="$2"; shift 2 ;;
-        --git-path)
-            [[ -n $2 && $2 == /* ]] || fail "--git-path requires an absolute path" 3
-            sgitpath="${2%/}"; shift 2 ;;
-        -y | --yes) autoYes=1; shift ;;
-        *) fail "Unknown option: $1" "Run with --help for the list." 3 ;;
-    esac
-done
-
-# Parsing comes first so --help works for anyone, and a typo is answered
-# before the user is told to go and find root.
 if [[ ! $EUID -eq 0 ]]; then
     echo "FOG updates must be run as root user"
     exit 1
 fi
 
+for sbindir in /usr/local/sbin /usr/sbin /sbin; do
+    [[ -d $sbindir ]] || continue
+    case ":${PATH}:" in
+        *:"${sbindir}":*) ;;
+        *) PATH="${PATH}:${sbindir}" ;;
+    esac
+done
+export PATH
+
+usage() {
+    echo -e "Usage: $0 [-h?y] [--channel stable|patches|beta|rc] [--branch <name>] [--git-path </path>]"
+    echo -e "\t-h -? --help\t\tDisplay this info"
+    echo -e "\t      --channel\tUpdate channel to track: stable, patches, beta or rc"
+    echo -e "\t               \t\tdefaults to whatever this server already tracks."
+    echo -e "\t               \t\trc follows the newest published rc-* branch"
+    echo -e "\t               \t\tForwarded to installfog.sh, which records it"
+    echo -e "\t      --branch\tCheck out an arbitrary branch instead of a channel"
+    echo -e "\t               \t\t(e.g. to test a PR/feature branch). One-off: does"
+    echo -e "\t               \t\tnot change the tracked channel for future runs"
+    echo -e "\t      --git-path\tOverride the git checkout path this server records"
+    echo -e "\t-y    --yes\t\tSkip the confirmation prompt AND run the installer"
+    echo -e "\t               \t\tunattended (-Y). Without it the installer runs"
+    echo -e "\t               \t\tinteractively, which is what a 1.5 -> 1.6"
+    echo -e "\t               \t\tupgrade wants. Pass it from cron and the GUI"
+    echo -e "\n\tEvery other install option belongs to installfog.sh and is no"
+    echo -e "\tlonger mirrored here. Run it directly if you need one:"
+    echo -e "\t  cd ${bindir} && ./installfog.sh --help"
+    echo -e "\n\tWhat survives an update, and where to put customizations so"
+    echo -e "\tthey do: docs/SUPPORTED_CUSTOMIZATIONS.md"
+    exit 0
+}
+
+shortopts="h?y"
+longopts="help,channel:,branch:,git-path:,yes"
+optargs=$(getopt -o $shortopts -l $longopts -n "$0" -- "$@")
+[[ $? -ne 0 ]] && usage
+eval set -- "$optargs"
+
+# Kept before the option loop shifts them away: the re-exec below needs the
+# ORIGINAL arguments.
+origArgs=("$@")
+autoYes=""
+while :; do
+    case $1 in
+        -h | -\? | --help)
+            usage
+            ;;
+        --channel)
+            schannel="$2"
+            shift 2
+            ;;
+        --branch)
+            sbranch="$2"
+            shift 2
+            ;;
+        --git-path)
+            if [[ -n "${2}" && "${2}" == /* ]]; then
+                sgitpath="${2%/}"
+            else
+                echo "Error: --git-path requires an absolute path"
+                usage
+            fi
+            shift 2
+            ;;
+        -y | --yes)
+            autoYes=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Re-exec from a copy of this file, before going anywhere near git.
+#
+# This script replaces itself. gitUpdateToBranch() checks out a different
+# branch, which rewrites bin/updatefog.sh underneath a bash process that is
+# still reading it -- and bash reads a script incrementally, seeking by byte
+# offset, so a file that changes length mid-run makes it resume in the middle
+# of a different line. The failure is silent, arbitrary, and happens AFTER the
+# checkout has already succeeded: the server's code has moved and the process
+# driving the update is executing fragments.
+#
+# It is not hypothetical here. Every channel switch changes this file, and the
+# 1.5 -> 1.6 crossing changes it beyond recognition.
+#
+# So: copy, re-exec, and do the git work from a file nothing is going to
+# rewrite. FOG_UPDATE_RELAUNCHED marks the copy so it does not loop; the copy
+# removes itself on exit, not here, because it is the file being read.
+# ---------------------------------------------------------------------------
 if [[ -z $FOG_UPDATE_RELAUNCHED ]]; then
-    relaunchFromCopy "${origArgs[@]}" || fail "Could not copy this script to a temporary location." \
-        "The update has to run from a copy, because checking out another branch" \
-        "rewrites this file while bash is still reading it." 1
+    updateSelfCopy=$(mktemp -t fog-updatefog.XXXXXX) && cat "$selfpath" > "$updateSelfCopy" || {
+        # Removing it here too: mktemp may well have succeeded and the cat
+        # failed, which would otherwise leave an empty file in /tmp on every
+        # attempt.
+        [[ -n $updateSelfCopy ]] && rm -f "$updateSelfCopy"
+        echo " * Could not copy this script to a temporary location."
+        echo " | The update has to run from a copy, because checking out another"
+        echo " | branch rewrites this file while bash is still reading it."
+        exit 1
+    }
+    chmod +x "$updateSelfCopy"
+    FOG_UPDATE_RELAUNCHED=1 FOG_UPDATE_ORIGIN="$workingdir" \
+        FOG_UPDATE_COPY="$updateSelfCopy" exec bash "$updateSelfCopy" "${origArgs[@]}"
 fi
 [[ -n $FOG_UPDATE_COPY ]] && trap 'rm -f "$FOG_UPDATE_COPY"' EXIT
-# After the re-exec, $bindir is the temp directory. The checkout is where the
-# ORIGINAL copy lived.
+# After the re-exec $bindir is the temp directory, so everything that has to
+# resolve against the CHECKOUT uses the original location instead.
 workingdir="${FOG_UPDATE_ORIGIN:-$workingdir}"
-gitpath=$(cd "$workingdir/.." && pwd)
-[[ -n $sgitpath ]] && gitpath="$sgitpath"
+cd "$workingdir"
 
-# ---------------------------------------------------------------------------
-# The 1.6 channel vocabulary, copied. Retired spellings honoured exactly as
-# lib/common/functions.sh on working-1.6 honours them -- an admin pasting a
-# command from an older forum post should get a working upgrade.
-#
-# Note `dev` means BETA, not dev-branch, despite a branch by that name. That
-# is the 1.6 vocabulary and this must not invent a different one.
-# ---------------------------------------------------------------------------
-normalizeChannel() {
-    case "$1" in
-        stable) echo "stable" ;;
-        patches|staging) echo "patches" ;;
-        beta|dev) echo "beta" ;;
-        rc) echo "rc" ;;
-        *) return 1 ;;
-    esac
-}
+# The update log. Set AFTER the re-exec, so it lands in the checkout rather
+# than beside the temporary copy -- and before anything that writes to it:
+# gitUpdateToBranch redirects into $error_log, and with it unset that is a
+# redirect into a file named "".
+[[ ! -d ./error_logs/ ]] && mkdir -p ./error_logs >/dev/null 2>&1
+error_log="${workingdir}/error_logs/fog_update_error.log"
+: > "$error_log"
 
-# Asked of the remote, by version order. -v:refname so rc-1.6.10 beats
-# rc-1.6.2; the remote advertises no commit dates, so a "newest" answer could
-# not be date-based even if that were preferable.
-#
-# refs/heads/rc-*, NOT a bare rc-*. ls-remote matches a pattern against the
-# TAIL of each ref at slash boundaries, so `rc-*` also matches
-# refs/heads/feat/rc-anything -- and against origin it does. That would put a
-# 1.5 server onto a feature branch while telling its admin it was the current
-# release candidate, on the one channel this whole script recommends. The sed
-# re-checks the extracted name for a further slash: two layers, because the
-# answer decides what a major upgrade checks out.
-rcBranch() {
-    local ref
-    ref=$(git ls-remote --heads --sort=-v:refname "$repo" 'refs/heads/rc-*' 2>/dev/null \
-        | sed -n 's#^[0-9a-f]\{7,\}[[:space:]]\{1,\}refs/heads/\(rc-[^/]\{1,\}\)$#\1#p' \
-        | head -n1) || return 1
-    [[ -n $ref ]] || return 1
-    echo "$ref"
-}
 
-channelToBranch() {
-    case "$(normalizeChannel "$1")" in
-        stable) echo "stable" ;;
-        patches) echo "dev-branch" ;;
-        beta) echo "working-1.6" ;;
-        rc) rcBranch || return 2 ;;
-        *) return 1 ;;
-    esac
-}
+# Un-exported on purpose: it inverts errorStat so a failed git step returns
+# control here instead of ending the process, and it must NOT leak into the
+# child installfog.sh, which needs errorStat to exit on failure as usual.
+exitFail=1
 
-# ---------------------------------------------------------------------------
-# Find the install. 1.5 has no fog_git_path, so the checkout is simply where
-# this script lives -- which is what the pre-relaunch $workingdir recorded.
-# ---------------------------------------------------------------------------
+. ../lib/common/functions.sh
+
+# Resolve which install this is updating -- same fog.conf pointer
+# installfog.sh itself reads (GH-850), so this always finds the same install
+# a fresh installfog.sh run on this box would.
 [[ -z $fogprogramdir && -r /etc/fog/fog.conf ]] && . /etc/fog/fog.conf
 [[ -z $fogprogramdir ]] && fogprogramdir="/opt/fog"
 fogprogramdir="${fogprogramdir%/}"
 
 if [[ ! -r "$fogprogramdir/.fogsettings" ]]; then
-    fail "No existing FOG install found at ${fogprogramdir} (.fogsettings missing)." \
-         "This updates an EXISTING install. For a new one, run installfog.sh." 1
+    echo " * No existing FOG install found at $fogprogramdir (.fogsettings missing)."
+    echo " * updatefog.sh updates an EXISTING install -- run installfog.sh first."
+    exit 1
 fi
 
-if [[ ! -d "${gitpath}/.git" ]]; then
-    fail "${gitpath} is not a git checkout." \
-         "This server was installed from a tarball or a copied directory, so" \
-         "there is no branch to move. Use the bootstrap installer instead --" \
-         "it clones a checkout and runs the installer over this install, which" \
-         "finds the existing server through /etc/fog/fog.conf:" \
-         "" \
-         "  curl -fsSL https://raw.githubusercontent.com/FOGProject/fogproject/working-1.6/bin/bootstrap.sh | bash -s -- --channel ${channel}" 1
-fi
+# .fogsettings before config.sh (the opposite order installfog.sh uses on a
+# fresh install): there is always a prior install here, so its recorded
+# osid/osname/docroot/etc. should win over config.sh's first-run defaults,
+# not the other way around. linuxReleaseName_lower is derived from osname
+# rather than re-detected, since only doOSSpecificIncludes' per-distro
+# config.sh actually needs it here.
+. "$fogprogramdir/.fogsettings"
+# Before the first read of a renamed key. On a .fogsettings written by a
+# pre-GH-1120 installer FOG_os_name and FOG_os_id do not exist yet, and the
+# doOSSpecificIncludes below is -n guarded, so without this the distro config
+# is silently SKIPPED rather than failing loudly.
+migrateDeprecatedKeys
+linuxReleaseName_lower="${FOG_os_name,,}"
+. ../lib/common/config.sh
+[[ -n ${FOG_os_id} ]] && doOSSpecificIncludes >/dev/null
+. ../lib/common/update.sh
 
-if [[ -z $branch ]]; then
-    branch=$(channelToBranch "$channel")
+[[ -n $sgitpath ]] && FOG_git_path="$sgitpath"
+
+# Forwarded to installfog.sh only when the admin actually asked for a channel,
+# so a plain re-run never restates one and cannot overwrite what the server
+# already holds.
+channelArgs=()
+
+if [[ -n $sbranch ]]; then
+    # --branch is a one-off deviation for testing, not a channel switch -- it
+    # deliberately leaves FOG_update_channel untouched, so a later run without
+    # --branch goes right back to tracking whatever channel was configured.
+    branch="$sbranch"
+    echo " * FOG Update"
+    echo "   Git path: ${FOG_git_path}"
+    echo "   Branch:   $branch (custom -- not a tracked channel)"
+    echo
+else
+    [[ -n $schannel ]] && FOG_update_channel="$schannel"
+
+    if [[ -z ${FOG_update_channel} ]]; then
+        echo " * No update channel configured for this server, and none given via --channel."
+        echo " * Pass --channel stable|patches|beta|rc, or --branch for a one-off checkout."
+        exit 1
+    fi
+
+    branch=$(channelToBranch "${FOG_update_channel}")
     case $? in
         0) ;;
-        2) fail "No release candidate is currently published, so the rc channel" \
-                "has nothing to check out. This is normal between releases." \
-                "" \
-                "Use --channel beta for the 1.6 development line, or wait." 3 ;;
-        *) fail "Unknown channel: ${channel}" \
-                "Expected rc, beta, stable or patches. The retired names staging" \
-                "and dev are also accepted, and mean patches and beta." 3 ;;
+        2)
+            # A channel FOG knows, that has nothing to point at right now. Not
+            # the admin's mistake, so it must not read like one -- and it is a
+            # state that resolves on its own when the next RC or beta line is
+            # published. Points at stable, the one line that always exists.
+            if [[ $(normalizeChannel "${FOG_update_channel}") == beta ]]; then
+                echo " * No beta line is currently published, so the beta channel"
+                echo " | has nothing to check out. This is normal right after a release."
+            else
+                echo " * No release candidate is currently published, so the rc channel"
+                echo " | has nothing to check out. This is normal between releases."
+            fi
+            echo " |"
+            echo " | Track the stable line instead with --channel stable, or pass a"
+            echo " | specific branch with --branch."
+            exit 1
+            ;;
+        3)
+            # The remote refused the question, so nothing is known about what
+            # is published. Seen as root on a checkout with an SSH origin: root
+            # holds no key for it. Saying "none published" there is wrong.
+            rcremote=$(git -C "${FOG_git_path}" remote get-url origin 2>/dev/null)
+            echo " * Could not ask ${rcremote:-the remote} which branch the ${FOG_update_channel} channel tracks."
+            echo " | git ls-remote failed: no network, or this user cannot authenticate"
+            echo " | to it. An SSH remote needs a key or an agent that root can use."
+            echo " |"
+            echo " | Check with: git ls-remote --heads ${rcremote:-<remote>}"
+            exit 1
+            ;;
+        *)
+            # Names the retired spellings too. They still WORK -- normalizeChannel
+            # folds them -- so anyone who reaches this line has a genuine typo, and
+            # the two vocabularies were confusable enough to be worth a sentence.
+            echo " * Unknown update channel: ${FOG_update_channel} (expected stable, patches, beta, or rc)"
+            echo " * The retired names staging and dev are still accepted, and mean patches and beta."
+            exit 1
+            ;;
     esac
-fi
 
-# ---------------------------------------------------------------------------
-# Say what this is before doing it. A 1.5 -> 1.6 move is not an update.
-# ---------------------------------------------------------------------------
-currentBranch=$(git -C "$gitpath" rev-parse --abbrev-ref HEAD 2>/dev/null)
-currentCommit=$(git -C "$gitpath" rev-parse HEAD 2>/dev/null)
+    [[ -n $schannel ]] && channelArgs=(--channel "${FOG_update_channel}")
 
-echo " * FOG Update"
-echo "   Checkout: ${gitpath}"
-echo "   Now on:   ${currentBranch:-unknown}"
-echo "   Moving to: ${branch}"
-echo
-
-crossing=0
-case $branch in
-    working-1.6|rc-*) [[ $currentBranch != working-1.6 && $currentBranch != rc-* ]] && crossing=1 ;;
-esac
-
-if [[ $crossing -eq 1 ]]; then
-    echo " * This is a MAJOR upgrade, 1.5 to 1.6, not a patch."
-    echo " |"
-    echo " | The database schema is migrated forward and the web tree is"
-    echo " | replaced. The 1.6 installer takes a database dump before it starts,"
-    echo " | and the 1.6 tree carries bin/revertfog.sh, which uses that dump to"
-    echo " | put the server back. That dump is the ONLY supported way back --"
-    echo " | there is no down-migration and there will not be one."
-    echo " |"
-    echo " | Take your own backup as well, and read"
-    echo " | docs/SUPPORTED_CUSTOMIZATIONS.md in the 1.6 tree afterwards."
+    echo " * FOG Update"
+    echo "   Git path: ${FOG_git_path}"
+    echo "   Channel:  ${FOG_update_channel} ($branch)"
     echo
 fi
 
-# Checked BEFORE the checkout, not after.
-#
-# It used to sit beside the installer invocation, which meant a headless run
-# -- cron, CI, a container with no tty -- moved the working copy to 1.6 and
-# only then discovered it could not run the installer, leaving a 1.5 server
-# with a 1.6 source tree. bin/bootstrap.sh gets this ordering right and so
-# should this: the test costs nothing here and refuses before anything moves.
-if [[ -z $autoYes ]] && ! (exec < /dev/tty) 2>/dev/null; then
-    fail "No terminal is available, so the installer cannot run interactively." \
-         "Nothing has been changed." \
-         "" \
-         "Re-run from a terminal, or with --yes for an unattended install." \
-         "For a 1.5 -> 1.6 crossing --yes is a poor idea: the 1.6 installer" \
-         "asks about settings your .fogsettings has never held." 7
-fi
-
+# Kept even though installfog.sh has a confirmation of its own, and even now
+# that the installer runs interactively and so actually shows it. The two ask
+# different questions at different moments: the checkout is THIS script's own
+# destructive act and happens before the installer runs at all, so by the time
+# installfog.sh asks anything the working copy has already moved. --yes skips
+# both.
 if [[ -z $autoYes ]]; then
-    echo -n " * Continue? (Y/N) "
+    # Refuse before asking, when there is nobody to ask.
+    #
+    # `read` gets EOF from cron or the GUI, confirmGo comes back empty, the
+    # catch-all arm below fired and this exited 0 -- so the caller recorded a
+    # successful update that never happened. A scheduled job reporting success
+    # forever is worse than one reporting a failure, because nobody looks at
+    # the first kind.
+    #
+    # The tty is tested by OPENING it, not by [[ -t 0 ]]: stdin can be
+    # redirected for perfectly ordinary reasons while a terminal is still
+    # there to prompt on, and /dev/tty exists in contexts where opening it
+    # fails with ENXIO.
+    if ! (exec < /dev/tty) 2>/dev/null; then
+        echo " * No terminal is available to confirm this update on, and --yes"
+        echo " | was not given, so nothing has been changed."
+        echo " |"
+        echo " | Pass -y/--yes to run unattended, which is what cron and the"
+        echo " | web UI should do."
+        exit 7
+    fi
+    echo -n " * Continue with this update? (Y/N) "
     read confirmGo
     case $confirmGo in
         [Yy] | [Yy][Ee][Ss]) ;;
-        # A deliberate no is not a failure. EOF and a typo are not a no:
-        # with nobody at the keyboard `read` returns empty, and exiting 0
-        # there told the caller an update had succeeded when none had been
-        # attempted. The terminal check above catches the usual headless
-        # case; this covers a terminal that exists but answers nothing.
-        [Nn] | [Nn][Oo]) echo " * Canceled."; exit 0 ;;
-        "") echo " * No answer given -- canceled. Pass --yes to run unattended."; exit 7 ;;
-        *) echo " * Answer not recognized -- canceled."; exit 3 ;;
+        # A deliberate "no" is not a failure, so it stays exit 0. The EOF case
+        # above never reaches here.
+        [Nn] | [Nn][Oo])
+            echo " * Update canceled."
+            exit 0
+            ;;
+        *)
+            echo " * Answer not recognized -- update canceled."
+            exit 3
+            ;;
     esac
 fi
 
-# ---------------------------------------------------------------------------
-# Move the checkout. Safe to do now: this process is running from the copy.
-# ---------------------------------------------------------------------------
-echo " * Fetching"
-git -C "$gitpath" fetch --all || fail "git fetch failed." 6
-echo " * Checking out ${branch}"
-git -C "$gitpath" checkout "$branch" || fail "Could not check out ${branch}." 6
-git -C "$gitpath" reset --hard "origin/${branch}" || fail "Could not reset to origin/${branch}." 6
-
-if [[ ! -x "${gitpath}/bin/installfog.sh" && ! -f "${gitpath}/bin/installfog.sh" ]]; then
-    fail "${branch} has no bin/installfog.sh." \
-         "Nothing has been installed. To go back:" \
-         "  git -C ${gitpath} checkout --detach ${currentCommit}" 6
+if ! gitUpdateToBranch "$branch"; then
+    echo " * Git update failed -- nothing was installed."
+    # SHOW it, do not just name it. errorStat's own non-exitFail path already
+    # tails the log for exactly this reason, and this path is the one an admin
+    # reaches most: the git error ("couldn't find remote ref", "would be
+    # overwritten by checkout") is the whole diagnosis, and naming a file makes
+    # them go and open it. exitFail is set here, so errorStat returned instead
+    # of doing this itself.
+    if [[ -s $error_log ]]; then
+        echo " |"
+        while IFS= read -r line; do
+            echo " | $line"
+        done < <(tail -n 5 "$error_log")
+        echo " |"
+    fi
+    echo " * Full log: $error_log"
+    exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# Hand over to the installer that is now on disk -- which for a crossing is
-# 1.6's, not the one this script shipped beside.
+# INTERACTIVE by default, and -Y only when the admin asked for unattended.
 #
-# INTERACTIVE unless --yes. This is the case the whole file exists for, and it
-# is exactly the case where -Y is wrong: the 1.6 installer asks about settings
-# 1.5's .fogsettings has never held, and unattended it takes a default for each
-# of them without saying so.
-# ---------------------------------------------------------------------------
-if [[ -n $autoYes ]]; then
-    echo " * Starting the installer unattended"
-    (cd "${gitpath}/bin" && bash installfog.sh -Y)
-    installStatus=$?
-else
-    # No tty test here any more -- it happens before the checkout now, so by
-    # this point a terminal is known to exist.
-    echo " * Starting the installer"
-    echo
-    (cd "${gitpath}/bin" && bash installfog.sh < /dev/tty)
-    installStatus=$?
-fi
+# It was unconditionally -Y, which is defensible for a same-line update where
+# .fogsettings already holds every answer -- and wrong for the case that
+# matters most, a 1.5 server crossing to 1.6. That upgrade meets settings the
+# old .fogsettings has never held, and -Y takes a default for each of them
+# without ever saying so. An unattended install is a thing to opt into, not the
+# thing that happens because you typed `updatefog.sh`.
+#
+# Teed rather than redirected, for the same reason: an install nobody can see
+# cannot be answered, and even under --yes a long upgrade that prints nothing
+# until it ends is worse for whoever is watching it. The log keeps everything
+# it kept before.
+#
+# Everything else the installer does -- the backups, the restores, recording
+# the channel, naming a commit to go back to if this fails -- is its own, and
+# is identical whether or not this script invoked it.
+yesFlag=()
+[[ -n $autoYes ]] && yesFlag=(-Y)
+# PIPESTATUS, not $?: piping into tee makes $? tee's status, which is 0 even
+# when the installer failed.
+(cd "${FOG_git_path}/bin" && bash installfog.sh "${yesFlag[@]}" "${channelArgs[@]}" 2>&1 | tee -a "$error_log"; exit "${PIPESTATUS[0]}")
+installStatus=$?
+cd "$workingdir"
 
 if [[ $installStatus -eq 0 ]]; then
-    echo
     echo " * Update completed successfully."
-    [[ $crossing -eq 1 ]] && echo " * This server is now on FOG 1.6. From here, use its own bin/updatefog.sh."
     exit 0
 fi
 
-echo
-echo " * installfog.sh failed (exit ${installStatus})."
-echo " | Nothing has been reverted. To put the checkout back where it was:"
-echo " |"
-# --detach, not reset --hard. This is the crossing case by definition: the
-# checkout is on working-1.6 or an rc-* branch while $currentCommit belongs
-# to stable, so resetting would point the NEW branch ref at an old commit and
-# leave it diverged. Detaching moves only HEAD, which is all that is wanted.
-#
-# The opposite of what a reset --hard onto origin/<branch> is for, which is
-# discarding local mess so an update can proceed. Going back through history
-# is a different job.
-echo " |     git -C ${gitpath} checkout --detach ${currentCommit}"
-echo " |     cd ${gitpath}/bin && ./installfog.sh"
-echo " |"
-if [[ $crossing -eq 1 ]]; then
-    echo " | If the database was already migrated, the checkout alone is not"
-    echo " | enough -- use bin/revertfog.sh from the 1.6 tree, which restores the"
-    echo " | pre-upgrade dump as well."
-    echo " |"
-fi
-exit "$installStatus"
+# No revert. installfog.sh has already named the commit to go back to if there
+# is one worth naming (offerRevert) -- but it printed that into $error_log,
+# because this script redirects the child there, so say where to look.
+echo " * installfog.sh failed (exit $installStatus)."
+echo " * The system has NOT been reverted. See $error_log -- if the checkout"
+echo " | moved, the installer named the commit to reset to at the end of it."
+echo " | bin/revertupdate.sh reports the same, and can do the checkout and the"
+echo " | database restore for you."
+exit $installStatus

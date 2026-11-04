@@ -9,11 +9,16 @@ imports, five things to redo when one is rebuilt.
 This document covers the ways to collapse that to one, what each costs, and how
 to tell which one you are actually in.
 
-> **Storage nodes on this line still generate their own self-signed CA.**
-> Automatic issuance from the master is a 1.6 feature and is not present here,
-> so a fleet of five nodes has six unrelated CAs. Option B below applies to
-> nodes just as it does to separate servers — treat each node as a server for
-> the purposes of this document.
+> **If your other machines are storage nodes, this is mostly solved already.**
+> A node asks its master for a certificate automatically on this line — see
+> [Storage nodes](PKI_ZONES.md#storage-nodes) — but issuance is conditional
+> on two things the master cannot fix for you: the node must resolve to a
+> hostname (no PTR and the request is refused outright), and that hostname
+> must fall inside the master's Web CA name constraints, which are fixed at
+> mint time. A node named `debian` under a CA permitting `DNS:lan` is
+> rejected; `debian.lan` succeeds. Where either does not hold, treat the node
+> as a separate server and use Option B. This document is otherwise for
+> servers with no master/node relationship.
 
 ---
 
@@ -83,8 +88,10 @@ https://<server>/fog/management/other/ca.cert.der
 
 Since the trust-store change, each server also anchors *itself* in its own
 system store at install time, so `curl` and `wget` **on** a FOG server work
-against that server without `-k`. That is per-server and does not federate;
-`--no-ca-trust` opts out.
+against that server without `-k`. That is per-server and does not federate, and
+it is unconditional -- GH-1120 removed the `--no-ca-trust` opt-out, because a
+server that cannot verify its own certificate is not a supported state and the
+failures surfaced far from the flag that caused them.
 
 Browsers still need a manual import — see [What is and is not
 unified](#what-is-and-is-not-unified).
@@ -105,22 +112,26 @@ root, so one anchor covers the fleet.
 
 ### 0. Check that your version can do this
 
-Option B needs `--web-ca-cert/--web-ca-key/--web-ca-root` on every satellite's
-installer, and `packages/pki/fog-mint-web-ca` on the hub. `dev-branch` carries
-both, and so does the 1.6 line. A **released 1.5.x `stable` carries neither** —
-there is no `packages/pki` on it at all — so `git pull` on a `stable` checkout
-will not produce these flags however many times you run it; you have to be on a
-line that ships them.
+Option B needs the PKI zone layout on **every** server involved: the
+`--web-ca-cert/--web-ca-key/--web-ca-root` flags on each satellite's installer,
+and `packages/pki/fog-mint-web-ca` plus a root key at
+`/opt/fog/pki/root/ca/.fogCA.key` on the hub. The 1.6 line and `dev-branch`
+(the actively-patched 1.5 line) both have all of it. A **released 1.5.x
+`stable` has none of it** — no `packages/pki` at all, no zone split, and the
+root key still sitting beside its certificate in `snapins/ssl/CA`. `git pull`
+on a `stable` checkout will not produce these flags; you have to be on a line
+that carries them.
 
 From each checkout:
 
 ```bash
 test -x packages/pki/fog-mint-web-ca && grep -q web-ca-cert bin/installfog.sh \
     && echo "Option B available" \
-    || echo "not on this line — Option A or C only"
+    || echo "pre-PKI layout — Option A or C only"
 ```
 
-A server without them can be neither hub nor satellite.
+A pre-PKI server cannot participate as a hub or as a satellite. Update it to a
+line that carries the zone split first, or use Option A or C for that server.
 
 ### 1. Issue a CA per server, on the hub
 
@@ -171,12 +182,11 @@ sudo ./installfog.sh --web-ca-cert /root/webca/webca.pem \
 
 Unpacking as root keeps `webca.key` unreadable to other accounts; it stays on
 this server permanently, so where it lands matters. Remove the tarball from your
-home directory afterwards.
+home directory afterward.
 
-Passing any one of the three is what marks the install as using an external CA;
-there is no separate flag to set. You pass them **once** — the files are
-imported into the web zone and later upgrades reuse the import without the
-flags.
+`--external-ca` is not needed; any one of the three implies it. You pass these
+**once** — the files are imported into the web zone and later upgrades reuse the
+import without the flags.
 
 ### 4. Anchor the hub root wherever you need it
 
@@ -217,9 +227,9 @@ authority for another, and your existing rotation and revocation processes
 apply.
 
 An internal ACME CA (step-ca and similar) is the best fit overall, because the
-anchor is stable while the leaves rotate automatically. See the Let's Encrypt
-and ACME section of [PKI_ZONES.md](PKI_ZONES.md#lets-encrypt-and-acme) for the
-renewal model and the caveats that apply to public Let's Encrypt.
+anchor is stable while the leaves rotate automatically. See
+[EXTERNAL_CA_AND_LETSENCRYPT.md](EXTERNAL_CA_AND_LETSENCRYPT.md), which covers
+ACME, public Let's Encrypt's caveats, and the renewal model in full.
 
 ## What is and is not unified
 
@@ -230,7 +240,7 @@ questions.
 |---|---|---|
 | Web (HTTPS vhost) | **yes** | what `--web-ca-*` targets |
 | Client communication | **no** | each server keeps its own root; fog-client pins per server |
-| Secure Boot | **no** | its own zone. On this line you supply a key with `--secure-boot-key`/`--secure-boot-cert`; there is no `--secureboot-ca-cert` here, that is 1.6 only. See [PKI_ZONES.md](PKI_ZONES.md) |
+| Secure Boot | **no** | see `--secureboot-ca-cert` in [PKI_ZONES.md](PKI_ZONES.md#bringing-your-own-ca) — 1.6 only, `dev-branch` has no such flag |
 
 **fog-client is deliberately untouched.** It pins the root of the server it
 registered against, and that root is not replaced by `--web-ca-*` — which is
@@ -270,6 +280,22 @@ and then skipped reissue because the *names* had not changed — a clean install
 that changed nothing. The signing CA is now part of that check. On a version
 with the fix, the next run reissues once by itself.
 
+**The leaf on disk is correct but the server still sends the old one.**
+Check for two FOG vhosts in one file:
+
+```bash
+grep -c '^<VirtualHost \*:443>' /etc/apache2/sites-available/001-fog.conf   # Apache
+grep -c '^server {' /etc/nginx/conf.d/fog.conf                              # nginx
+```
+
+A `2` means the install upgraded across the introduction of the FOG-managed
+vhost block while that migration still appended rather than replaced, so FOG's
+previous vhost is sitting above the managed one — and the first matching vhost
+is the one the web server uses. Update the installer and run it again; it
+detects and removes the stale copy by itself now. `openssl x509 -in
+"$(grep -oP "(?<=^PKI_web_vhost_cert=').*(?=')" /opt/fog/.fogsettings)" -noout -issuer`
+is what tells you the leaf itself was fine all along.
+
 **The far server's web tier will not start, or its certificate does not
 verify.** Its leaf carries a name the CA does not permit. Every FOG leaf
 includes `fogserver` and `fog-server` regardless of hostname, plus the host's
@@ -278,11 +304,15 @@ names passed as extra arguments. `fog-mint-web-ca` probes for this before
 emitting, so this mostly appears when a CA was built by hand.
 
 **The installer prompts for CA paths even though you passed the flags.**
-Fixed. Passing `--web-ca-*` set `externalca=yes`, which triggered the
-interactive prompt for the *flat* `extcacert`/`extcakey`/`extcaroot` paths —
-and those were then ignored, because the command-line values take precedence.
-Pressing Enter through it was harmless. On a version with the fix the run prints
-the paths it is using instead.
+Fixed, twice. Passing `--web-ca-*` used to set `externalca=yes`, which triggered
+the interactive prompt for the *flat* `extcacert`/`extcakey`/`extcaroot` paths —
+and those were then ignored, because the command-line values took precedence.
+Pressing Enter through it was harmless. A version with the first fix prints the
+paths it is using instead.
+
+GH-1120 removed the cause rather than the symptom: those six keys held three
+values reached two ways, and both spellings now write one run-scoped input, so
+the prompt and the flags cannot disagree.
 
 **`Refusing to continue: the root ... carries pathlen:0`.** That root cannot
 anchor an intermediate, so nothing beneath it would verify. Use a root that can,
@@ -295,5 +325,7 @@ every CA you need in one sitting, then take it away again — see
 ## See also
 
 - [PKI_ZONES.md](PKI_ZONES.md) — the three zones, layout, name constraints, key protection
+- [EXTERNAL_CA_AND_LETSENCRYPT.md](EXTERNAL_CA_AND_LETSENCRYPT.md) — ACME, Let's Encrypt, renewal
 - `packages/pki/fog-mint-web-ca` — issue a Web CA for another FOG server
 - `packages/pki/fog-offline-ca-key` — move a CA private key off the server
+- `packages/pki/fog-sign-node-cert` — how storage nodes are issued (different mechanism)

@@ -2,11 +2,19 @@
 
 ## Introduction
 
- FOG is a free open-source cloning/imaging/rescue suite/inventory management system. FOG can be used to image Windows XP, Vista, Windows 7, Window 8/8.1, and Windows 10, Windows 11 PCs using PXE, PartClone, and a Web GUI to tie it together. Includes features like memory and disk test, disk wipe, av scan, task scheduling, inventory management, remote deployment of OS's, and remote installation of software packages. Features can be triggered through the web GUI, once the client machine has been registered with FOG.
+ FOG is a free open-source cloning/imaging/rescue suite/inventory management system. FOG can be used to image Windows XP, Vista, Windows 7, Windows 8/8.1, Windows 10, and Windows 11 PCs using PXE, PartClone, and a Web GUI to tie it together. Includes features like memory and disk test, disk wipe, av scan, task scheduling, inventory management, remote deployment of OS's, and remote installation of software packages. Features can be triggered through the web GUI, once the client machine has been registered with FOG.
 
 ## Versioning and branches
 
-FOG uses a versioning schema that follows the general principles of semantic versioning with some adjustments to fit the development lifecycle. You can find the automatic release workflows in the [fog-workflows repo](https://github.com/FOGProject/fog-workflows) [![Stable Release](https://github.com/FOGProject/fog-workflows/actions/workflows/stable-releases.yml/badge.svg)](https://github.com/FOGProject/fog-workflows/actions/workflows/stable-releases.yml)
+FOG uses a versioning schema that follows the general principles of semantic versioning with some adjustments to fit the development lifecycle. You can find the automatic release workflows in the [fog-workflows repo](https://github.com/FOGProject/fog-workflows) and the distro install tests in https://github.com/FOGProject/fogproject-install-validation
+
+ 
+
+
+| Workflow | Status |
+|----------|--------|
+| Release | [![Stable Release](https://github.com/FOGProject/fog-workflows/actions/workflows/stable-releases.yml/badge.svg)](https://github.com/FOGProject/fog-workflows/actions/workflows/stable-releases.yml) |
+| RHEL Distros | [![AlmaLinux 10](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_alma_10.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_alma_10.yml) [![AlmaLinux 9](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_alma_9.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_alma_9.yml) [![Debian 12](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_debian_12.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_debian_12.yml) [![Debian 13](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_debian_13.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_debian_13.yml) [![Fedora 40](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_fedora_40.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_fedora_40.yml) [![Fedora 41](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_fedora_41.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_fedora_41.yml) [![Fedora 42](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_fedora_42.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_fedora_42.yml) [![Rocky 10](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_rocky_10.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_rocky_10.yml) [![Rocky 9](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_rocky_9.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_rocky_9.yml) [![Ubuntu 22.04](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_ubuntu_22_04.yml/badge.svg)](https://github.com/FOGProject/fogproject-install-validation/actions/workflows/distro_ubuntu_22_04.yml)|
 
 * The default branch of `stable` will always have the latest patch release, for most users this is where you want to install from.
 * The `master` branch has the baseline of the latest Minor release. You should not typically install from here as it won't include security patches released since the baseline was set.
@@ -15,11 +23,21 @@ FOG uses a versioning schema that follows the general principles of semantic ver
 
 This gives us a Production, Staging, and Dev branches to follow standard devops practices.
 
-| Dev Cycle Stage  | Branches                                                                                                              | Version Property Associated |
-|------------------|-----------------------------------------------------------------------------------------------------------------------| ----------------------------|
-| Production       | stable, master                                                                                                        | Minor and Patch
-| Staging          | dev-branch                                                                                                            | Patch
-| Dev              | working-*, {feature-name}                                                                                             | Major, Minor
+| Dev Cycle Stage  | Channel   | Branches                    | Version Property Associated |
+|------------------|-----------|-----------------------------|-----------------------------|
+| Production       | `stable`  | stable, master              | Minor and Patch |
+| Staging          | `patches` | dev-branch                  | Patch |
+| Dev              | `beta`    | working-*, {feature-name}   | Major, Minor |
+
+The **Channel** column is the value to put in `FOG_update_channel` in
+`.fogsettings`, or to pass to `bin/updatefog.sh --channel`. It is the same word
+as the `FOG_CHANNEL` your server reports, in lowercase — one vocabulary for
+both, so the value you configure and the value you read back agree.
+
+> The earlier spellings `staging` and `dev` mean `patches` and `beta`
+> respectively, and are still accepted so existing servers keep updating. They
+> are no longer the documented names: `dev` in particular pointed at
+> `working-1.6`, not at `dev-branch`, which read as a typo and was not one.
 
 See also: [Version Sync Automation](https://docs.fogproject.org/en/latest/version-sync-automation) for how `FOG_VERSION`/`FOG_CHANNEL` are kept in sync with git state on each branch.
 
@@ -28,8 +46,8 @@ Current version on each of the main branches (updated automatically - see the do
 | Channel | Version |
 |---|---|
 | [`Stable`](https://github.com/FOGProject/fogproject/tree/stable) | [![stable version](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/FOGProject/fog-workflows/main/badges/stable.json)](https://github.com/FOGProject/fogproject/tree/stable) |
-| [`Staging`](https://github.com/FOGProject/fogproject/tree/dev-branch) | [![dev-branch version](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/FOGProject/fog-workflows/main/badges/dev-branch.json)](https://github.com/FOGProject/fogproject/tree/dev-branch) |
-| [`Dev`](https://github.com/FOGProject/fogproject/tree/working-1.6) | [![working-1.6 version](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/FOGProject/fog-workflows/main/badges/working-1.6.json)](https://github.com/FOGProject/fogproject/tree/working-1.6) |
+| [`Patches`](https://github.com/FOGProject/fogproject/tree/dev-branch) | [![dev-branch version](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/FOGProject/fog-workflows/main/badges/dev-branch.json)](https://github.com/FOGProject/fogproject/tree/dev-branch) |
+| [`Beta`](https://github.com/FOGProject/fogproject/tree/working-1.6) | [![working-1.6 version](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/FOGProject/fog-workflows/main/badges/working-1.6.json)](https://github.com/FOGProject/fogproject/tree/working-1.6) |
 
 ### Version Format
 
@@ -95,6 +113,8 @@ cd /path/to/fogproject-dev-branch/bin
 All should now be installed and you can start configuring and registering systems. Please see: http://fogproject.org/wiki/index.php/Managing_FOG to assist you in setting up further.
 
 There are many resources for assistance.
+ - **CSV Import/Export:** see [docs/CSV_IMPORT_EXPORT.md](docs/CSV_IMPORT_EXPORT.md) for the mass import/export file format — headered or positional columns per object type, and the associations column.
+ - **Group shared state:** see [docs/GROUP_SHARED_STATE.md](docs/GROUP_SHARED_STATE.md) for how the group edit page surfaces what member hosts share — tri‑state associations (snapins/printers/modules) and no‑clobber config values (AD, auto‑logout, kernel/general, default printer).
  - **docs:** https://docs.fogproject.org for documentation. (New docs, under construction)
  - **Wiki:** http://fogproject.org/wiki for any information. (Legacy docs)
  - **Forum:** http://fogproject.org/forum.

@@ -19,15 +19,11 @@
  * same finished transfer about ten times a second for as long as it lives
  * -- an unbounded log, and proc_close() called repeatedly on one handle.
  *
- * Observed on the 1.6 lab, where 'Sync finished - Resource id #1348' filled
- * the log at roughly ten lines a second as soon as a transfer completed.
- * The same change reached this branch in ac4bd48e7 on the same day, so the
- * defect is identical here -- and this branch's replication has always run,
- * which makes it the one that hits it in the field. The casts were added for
- * PHP 8 null safety, which is a real need, so the fix keeps them and
- * iterates over array_keys() snapshots instead, writing through
- * $this->procRef by path. Note the procPipes unsets already went through by
- * full path and were never affected; procRef was.
+ * Observed on the 1.6 lab the moment Group -> Group replication started
+ * working: 'Sync finished - Resource id #1348' filled the log at roughly
+ * ten lines a second. The casts had been added the same day for PHP 8 null
+ * safety, which is a real need -- so the fix keeps them and iterates over
+ * array_keys() snapshots instead, writing through $this->procRef by path.
  *
  * This runs the REAL method, lifted from the shipped file.
  *
@@ -35,7 +31,7 @@
  * Exit status 0 = pass, 1 = fail.
  */
 
-$src = __DIR__ . '/../packages/web/lib/service/fogservice.class.php';
+$src = __DIR__ . '/../packages/web/src/Service/FOGService.php';
 $code = file_get_contents($src);
 if (false === $code) {
     fwrite(STDERR, "cannot read $src\n");

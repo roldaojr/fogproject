@@ -1,0 +1,575 @@
+#!/bin/bash
+#
+# The one-liner bootstrap does the irreducible pre-clone work, and no more.
+#
+#   tests/bootstrap-installer.test.sh
+#
+# GH-1006. bin/bootstrap.sh is fetched over HTTP and piped into bash as root on
+# a machine with nothing on it, which makes almost every interesting case here
+# a REFUSAL: the wrong distro, no terminal, a directory that is not ours. A
+# bootstrap that guesses in any of those is worse than one that stops.
+#
+# The two that matter most:
+#
+#   * An unsupported distribution is refused BEFORE git is installed. The
+#     alternative leaves a machine carrying packages and a checkout it cannot
+#     use, and says so several minutes later.
+#
+#   * No terminal and no --yes is a refusal, not a silent fall back to -Y.
+#     Under `curl ... | bash` the script's stdin is the pipe, so the installer
+#     has to be handed /dev/tty or it answers its own prompts with the
+#     remaining bytes of this file. Where there is no tty to hand it, starting
+#     an unattended root install of imaging software on a machine nobody is
+#     watching is not a reasonable default.
+#
+# Nothing here runs as root, installs a package, or reaches the network. The
+# root check is neutered in a COPY of the script, the package managers and git
+# are stubs on PATH, and the distro is chosen by pre-setting linuxReleaseName,
+# which detectOSFamily is [[ -z ]]-guarded to respect.
+#
+# OS=Linux is exported for the same reason: bootstrap.sh does
+# `[[ -z $OS ]] && OS=$(uname -s)`, and on a developer's machine uname may not
+# say Linux at all -- this suite runs under Git Bash on Windows in at least one
+# place. The override uses the guard the script already provides rather than
+# patching the check out, so the check itself stays exercised: the unmodified
+# script is run WITHOUT the override further down to prove it still refuses.
+#
+# Usage: bash tests/bootstrap-installer.test.sh
+# Exit status 0 = pass, 1 = fail.
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+bootstrap="$root/bin/bootstrap.sh"
+
+pass=0
+fail=0
+
+check() {
+    if [[ $2 -eq 0 ]]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        printf '  FAIL  %s\n' "$1"
+    fi
+}
+
+if [[ ! -r $bootstrap ]]; then
+    echo "FAIL: cannot read $bootstrap" >&2
+    exit 1
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# ---------------------------------------------------------------------------
+# The real script, unmodified. Everything before the root check is reachable
+# without being root, which is most of the argument handling.
+# ---------------------------------------------------------------------------
+bash "$bootstrap" --help >/dev/null 2>&1
+check "--help exits 0" "$?"
+
+check "--help works before the root check, so a user can read it" \
+    "$(bash "$bootstrap" --help 2>&1 | grep -q -- '--channel'; echo $?)"
+
+# A non-root run now ELEVATES rather than refusing, so what is asserted is
+# that it reaches for sudo with the arguments it was given -- and that it still
+# refuses, with a reason, when it cannot.
+#
+# sudo is stubbed. The real one would prompt for a password, which no test
+# should do, and what matters here is which command gets handed to it.
+elevwork="$work/elevate"
+mkdir -p "$elevwork/sb"
+printf '#!/bin/bash\necho "SUDO $*" >> "$ELEVLOG"\n' > "$elevwork/sb/sudo"
+chmod +x "$elevwork/sb/sudo"
+elevlog="$elevwork/log"
+
+: > "$elevlog"
+elevout=$( export PATH="$elevwork/sb:$PATH" ELEVLOG="$elevlog"
+           bash "$bootstrap" --channel beta < /dev/null 2>&1 )
+
+check "a non-root run from a file re-runs itself under sudo" \
+    "$(grep -q '^SUDO ' "$elevlog"; echo $?)"
+
+check "and passes the arguments through" \
+    "$(grep -q -- '--channel beta' "$elevlog"; echo $?)"
+
+check "and sets the loop guard so the child cannot elevate again" \
+    "$(grep -q 'FOG_BOOTSTRAP_ELEVATED=1' "$elevlog"; echo $?)"
+
+check "and says what it is about to do first" \
+    "$(grep -qi 'Re-running this file under sudo' <<< "$elevout"; echo $?)"
+
+# The guard itself: a child that is still not root must refuse, not fetch and
+# elevate a second time.
+: > "$elevlog"
+elevout=$( export PATH="$elevwork/sb:$PATH" ELEVLOG="$elevlog" FOG_BOOTSTRAP_ELEVATED=1
+elevstatus=0
+( export PATH="$elevwork/sb:$PATH" ELEVLOG="$elevlog" FOG_BOOTSTRAP_ELEVATED=1
+  bash "$bootstrap" --channel beta < /dev/null ) >/dev/null 2>&1 || elevstatus=$?
+check "and exits non-zero" \
+    "$([[ $elevstatus -ne 0 ]]; echo $?)"
+
+           bash "$bootstrap" --channel beta < /dev/null 2>&1 )
+
+check "an already-elevated run that is still not root does not elevate again" \
+    "$([[ ! -s $elevlog ]]; echo $?)"
+
+
+check "and still says it must be run as root" \
+    "$(grep -q 'must be run as root user' <<< "$elevout"; echo $?)"
+
+check "naming the reason rather than a generic message" \
+    "$(grep -qi 'sudoers rule' <<< "$elevout"; echo $?)"
+    "$(bash "$bootstrap" 2>&1 | grep -q 'must be run as root user'; echo $?)"
+
+for bad in "--nonsense" "--channel" "--branch" "--git-path relative/path"; do
+    bash "$bootstrap" $bad >/dev/null 2>&1
+    check "bad argument '${bad}' exits 3" "$([[ $? -eq 3 ]]; echo $?)"
+done
+
+# ---------------------------------------------------------------------------
+# A copy with the root gate removed, so the rest of the flow is reachable.
+# Nothing else is changed -- the point is to exercise the real logic.
+# ---------------------------------------------------------------------------
+sut="$work/bootstrap.sh"
+sed 's/^if \[\[ ! \$EUID -eq 0 \]\]; then$/if false; then/' "$bootstrap" > "$sut"
+if ! grep -q 'if false; then' "$sut"; then
+    echo "FAIL: could not neuter the root check -- it changed shape." >&2
+    echo "  Point this test at the new one; do not delete the assertions." >&2
+    exit 1
+fi
+
+# --- stubs ----------------------------------------------------------------
+# Three directories on purpose. installGit() returns early when git is already
+# on PATH, so the "which package manager" cases have to run with a PATH that
+# reaches NO git at all -- not the stub, and not the real one in /usr/bin
+# either. Naming /usr/bin in that PATH is what made these six assertions pass
+# vacuously: every machine that runs this suite, developer box and CI runner
+# alike, already has git, so installGit() returned at its first line and no
+# package manager was ever reached.
+#
+# Hence $sandbox: symlinks to the tools bootstrap.sh actually calls, git
+# deliberately absent, and nothing else on PATH. A tool added to the script
+# later fails here loudly rather than silently falling back to the host.
+pmstubs="$work/pm"      # package managers only
+stubs="$work/stubs"     # package managers + git
+sandbox="$work/nogit"   # host tools, minus git
+mkdir -p "$pmstubs" "$stubs" "$sandbox"
+calls="$work/calls.log"
+
+# The sandbox is built from SYMLINKS, which is the one thing about it that is
+# not portable. Where `ln -s` silently copies instead -- Git Bash on Windows is
+# the case that found this -- a copied bash.exe cannot locate its DLLs and dies
+# with "error while loading shared libraries", so every arm using the sandbox
+# fails for a reason that has nothing to do with the code under test.
+#
+# Detected rather than assumed, and the arms are SKIPPED rather than reported
+# as failures: six phantom failures in a suite are worse than six absent
+# assertions, because someone has to chase them. Linux CI takes the real path,
+# so the gate is not weakened where it runs.
+sandboxOk=1
+if ln -s /dev/null "$sandbox/.linkprobe" 2>/dev/null && [[ -L $sandbox/.linkprobe ]]; then
+    rm -f "$sandbox/.linkprobe"
+    # bash included: `bash "$sut"` is resolved with the PATH set for the run.
+    for tool in bash awk cat cut date env grep head ls mkdir rm sed sort stat tr tty uname which; do
+        src=$(command -v "$tool" 2>/dev/null) || {
+            echo "FAIL: $tool is not on PATH; the sandbox cannot be built." >&2
+            exit 1
+        }
+        ln -sf "$src" "$sandbox/$tool"
+    done
+else
+    rm -f "$sandbox/.linkprobe"
+    sandboxOk=0
+fi
+
+# Skips an assertion that needs the symlink sandbox, and says why once.
+skipNote=0
+skipSandbox() {
+    if [[ $skipNote -eq 0 ]]; then
+        echo "  SKIP  sandbox arms: this filesystem does not make real symlinks"
+        skipNote=1
+    fi
+}
+
+for tool in apt-get dnf yum pacman apk; do
+    cat > "$pmstubs/$tool" <<EOF
+#!/bin/bash
+echo "$tool \$*" >> "\$CALLS"
+exit 0
+EOF
+    chmod +x "$pmstubs/$tool"
+    cp "$pmstubs/$tool" "$stubs/$tool"
+done
+
+# git: records what it was asked, and makes `clone` produce a checkout that
+# looks real enough for the next step to act on.
+cat > "$stubs/git" <<'EOF'
+#!/bin/bash
+echo "git $*" >> "$CALLS"
+case "$1" in
+    clone)
+        # The destination is the LAST argument, not $3. It was $3 until
+        # --progress was added ahead of it, which is exactly the kind of
+        # positional assumption a stub should not make about the code it
+        # stands in for.
+        dest="${@: -1}"
+        mkdir -p "$dest/.git" "$dest/bin"
+        cat > "$dest/bin/installfog.sh" <<'INNER'
+#!/bin/bash
+echo "installfog $*" >> "$CALLS"
+exit 0
+INNER
+        chmod +x "$dest/bin/installfog.sh"
+        ;;
+    ls-remote)
+        # No release candidate published. One beta line, working-1.6, so the
+        # beta runs below have a branch to clone. Each is origin's real state.
+        # The pattern is the last argument.
+        case "${@: -1}" in
+            refs/heads/working-\*)
+                [[ -n $GIT_NO_BETA ]] && exit 0
+                echo "0123456789abcdef0123456789abcdef01234567	refs/heads/working-1.6"
+                ;;
+        esac
+        exit 0
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$stubs/git"
+
+# Every invocation goes through here so the environment is set the same way
+# each time. EXPORTED, not prefixed: a `VAR=x func` prefix sets the variable
+# for the function, not for the `bash` child it starts, so the script would
+# never see it.
+run() {
+    local distro="$1" version="$2"
+    shift 2
+    ( export PATH="$stubs:$PATH" CALLS="$calls" OS="Linux"
+      export linuxReleaseName="$distro" OSVersion="$version"
+      unset osfamily
+      cd "$work" && bash "$sut" "$@" )
+}
+
+# The same, on a machine that does not have git yet -- which is the machine
+# this script exists for.
+runNoGit() {
+    local distro="$1" version="$2"
+    shift 2
+    ( export PATH="$pmstubs:$sandbox" CALLS="$calls" OS="Linux"
+      export linuxReleaseName="$distro" OSVersion="$version"
+      unset osfamily
+      cd "$work" && bash "$sut" "$@" )
+}
+
+# ---------------------------------------------------------------------------
+# An unsupported distribution is refused, and refused EARLY.
+# ---------------------------------------------------------------------------
+: > "$calls"
+out=$(run "Void Linux" 1 --git-path "$work/void" 2>&1)
+st=$?
+check "an unsupported distribution exits 4" "$([[ $st -eq 4 ]]; echo $?)"
+check "it names the distribution it refused" \
+    "$(grep -q 'Void Linux' <<< "$out"; echo $?)"
+check "it lists what IS supported" \
+    "$(grep -qi 'Alpine' <<< "$out" && grep -qi 'Debian' <<< "$out"; echo $?)"
+check "nothing was installed before the refusal" \
+    "$([[ ! -s $calls ]]; echo $?)"
+check "and nothing was cloned" \
+    "$([[ ! -d $work/void ]]; echo $?)"
+
+# ---------------------------------------------------------------------------
+# Each family reaches for its own package manager.
+# ---------------------------------------------------------------------------
+declare -A wanted=( [Ubuntu]=apt-get [Debian]=apt-get ["Rocky Linux"]=dnf ["Alpine Linux"]=apk ["Arch Linux"]=pacman )
+for name in Ubuntu Debian "Rocky Linux" "Alpine Linux" "Arch Linux"; do
+    [[ $sandboxOk -eq 1 ]] || { skipSandbox; continue; }
+    : > "$calls"
+    dir="$work/fam-${name// /_}"
+    runNoGit "$name" 1 --git-path "$dir" --yes >/dev/null 2>&1
+    # Asked to install GIT, not merely invoked: the debian arm runs
+    # `apt-get -yq update` first, so a bare "^apt-get " matches even when the
+    # install line is gone.
+    check "${name} installs git with ${wanted[$name]}" \
+        "$(grep -qE "^${wanted[$name]} .*(^| )git( |$)" "$calls"; echo $?)"
+done
+
+# dnf-before-yum is the fallback installfog.sh already uses on this family.
+if [[ $sandboxOk -eq 1 ]]; then
+: > "$calls"
+nodnf="$work/nodnf"
+mkdir -p "$nodnf"
+cp "$pmstubs/yum" "$nodnf/"
+( export PATH="$nodnf:$sandbox" CALLS="$calls" OS="Linux"
+  unset osfamily
+  export linuxReleaseName="CentOS Linux" OSVersion=9
+  cd "$work" && bash "$sut" --git-path "$work/yumbox" --yes ) >/dev/null 2>&1
+check "a Red Hat box without dnf falls back to yum" \
+    "$(grep -qE '^yum .*(^| )git( |$)' "$calls"; echo $?)"
+else
+    skipSandbox
+fi
+
+# ---------------------------------------------------------------------------
+# Channels resolve to branches, and rc says something true when there is none.
+# ---------------------------------------------------------------------------
+for pair in "stable:stable" "patches:dev-branch" "beta:working-1.6" "dev:working-1.6" "staging:dev-branch"; do
+    ch="${pair%%:*}"; want="${pair#*:}"
+    : > "$calls"
+    run Ubuntu 22 --git-path "$work/ch-$ch" --channel "$ch" --yes >/dev/null 2>&1
+    check "--channel ${ch} checks out ${want}" \
+        "$(grep -q "^git -C .* checkout ${want}$" "$calls"; echo $?)"
+done
+
+: > "$calls"
+out=$(run Ubuntu 22 --git-path "$work/rc" --channel rc --yes 2>&1)
+check "--channel rc with none published says so, rather than 'unknown channel'" \
+    "$(grep -qi 'No release candidate is currently published' <<< "$out"; echo $?)"
+check "and does not clone anything" \
+    "$([[ ! -d $work/rc ]]; echo $?)"
+
+# beta with no working-* branch: the state between the 1.6.0 release and the
+# next beta line. Same shape as rc: say so, and clone nothing.
+: > "$calls"
+out=$(export GIT_NO_BETA=1; run Ubuntu 22 --git-path "$work/nobeta" --channel beta --yes 2>&1)
+check "--channel beta with none published says so" \
+    "$(grep -qi 'No beta line is currently published' <<< "$out"; echo $?)"
+check "and does not clone anything either" \
+    "$([[ ! -d $work/nobeta ]]; echo $?)"
+
+: > "$calls"
+out=$(run Ubuntu 22 --git-path "$work/bogus" --channel nonsense --yes 2>&1)
+check "an unknown channel is a different message" \
+    "$(grep -qi 'Unknown channel' <<< "$out"; echo $?)"
+check "which still names the retired spellings" \
+    "$(grep -qi 'staging and dev' <<< "$out"; echo $?)"
+
+# --branch is a one-off and must NOT record a channel.
+: > "$calls"
+run Ubuntu 22 --git-path "$work/br" --branch some-pr-branch --yes >/dev/null 2>&1
+check "--branch checks out the literal branch" \
+    "$(grep -q 'checkout some-pr-branch$' "$calls"; echo $?)"
+check "--branch does not forward --channel to the installer" \
+    "$(! grep -q 'installfog.*--channel' "$calls"; echo $?)"
+
+# The other half of the same rule, on its own run so it reads its own log.
+: > "$calls"
+run Ubuntu 22 --git-path "$work/fwd" --channel beta --yes >/dev/null 2>&1
+check "a channel run DOES forward --channel to the installer" \
+    "$(grep -q 'installfog.*--channel beta' "$calls"; echo $?)"
+
+# ---------------------------------------------------------------------------
+# Idempotence: an existing checkout is never cloned over or reset.
+# ---------------------------------------------------------------------------
+existing="$work/existing"
+mkdir -p "$existing/.git" "$existing/bin"
+echo "mine" > "$existing/precious"
+cat > "$existing/bin/installfog.sh" <<'EOF'
+#!/bin/bash
+echo "installfog $*" >> "$CALLS"
+EOF
+: > "$calls"
+out=$(run Ubuntu 22 --git-path "$existing" --channel beta --yes 2>&1)
+check "an existing checkout is not cloned over" \
+    "$(! grep -q '^git clone' "$calls"; echo $?)"
+check "a file in it survives" \
+    "$([[ $(cat "$existing/precious") == mine ]]; echo $?)"
+check "nothing is reset --hard" \
+    "$(! grep -q 'reset --hard' "$calls"; echo $?)"
+check "it points the admin at updatefog.sh instead" \
+    "$(grep -q 'updatefog.sh' <<< "$out"; echo $?)"
+
+# A non-empty directory that is NOT a checkout is refused rather than merged.
+notours="$work/notours"
+mkdir -p "$notours"
+echo x > "$notours/somefile"
+run Ubuntu 22 --git-path "$notours" --yes >/dev/null 2>&1
+check "a non-empty directory that is not a checkout exits 6" \
+    "$([[ $? -eq 6 ]]; echo $?)"
+check "and is left alone" \
+    "$([[ -f $notours/somefile && ! -d $notours/.git ]]; echo $?)"
+
+# ---------------------------------------------------------------------------
+# The tty rule. This test process has no controlling terminal, which is
+# exactly the cloud-init/CI case.
+# ---------------------------------------------------------------------------
+: > "$calls"
+out=$(run Ubuntu 22 --git-path "$work/notty" --channel beta < /dev/null 2>&1)
+st=$?
+if [[ $st -eq 7 ]]; then
+    ok=0
+else
+    # A tty IS available in some local shells; the refusal cannot be observed
+    # there, and reporting a pass would be a lie either way.
+    ok=$( (exec < /dev/tty) 2>/dev/null && echo 0 || echo 1 )
+    [[ $ok -eq 0 ]] && echo "  SKIP  no-tty refusal (this shell has a usable /dev/tty)"
+fi
+check "no tty and no --yes exits 7 rather than installing unattended" "$ok"
+
+if [[ $st -eq 7 ]]; then
+    check "it tells the user to pass --yes" \
+        "$(grep -q -- '--yes' <<< "$out"; echo $?)"
+    check "it does not start the installer" \
+        "$(! grep -q '^installfog' "$calls"; echo $?)"
+    # The clone is fine to have happened -- the machine is further along and
+    # nothing is lost. What must not happen is an install nobody asked for.
+    check "the refusal comes after the clone, not instead of it" \
+        "$(grep -q '^git clone' "$calls"; echo $?)"
+fi
+
+# --yes installs unattended, which is the whole point of the flag.
+: > "$calls"
+run Ubuntu 22 --git-path "$work/yes" --channel beta --yes >/dev/null 2>&1
+check "--yes runs the installer" \
+    "$(grep -q '^installfog' "$calls"; echo $?)"
+check "--yes passes -Y" \
+    "$(grep -q '^installfog.*-Y' "$calls"; echo $?)"
+
+# ---------------------------------------------------------------------------
+# bootstrap.sh's own rcBranch, against a real remote.
+#
+# Everything above runs with a git STUB whose ls-remote answers nothing, so it
+# cannot see what this catches: a bare `rc-*` pattern matches the TAIL of a ref
+# at slash boundaries, and so picks up refs/heads/feat/rc-anything. This is the
+# second copy of a function lib/common/functions.sh also carries -- the copy
+# bootstrap.sh has to carry, because it runs before there is a clone -- and the
+# two diverging silently is the exact hazard this file exists to police.
+# tests/rc-channel-resolution.test.sh pins the functions.sh copy the same way.
+# ---------------------------------------------------------------------------
+rcfn=""
+for fn in rcBranch betaBranch newestBranch; do
+    rcfn+=$(awk -v fn="$fn" '$0 ~ "^" fn "\\(\\) \\{" { grab = 1 } grab { print } grab && /^\}/ { exit }' "$bootstrap")
+    rcfn+=$'\n'
+done
+if ! grep -q '^rcBranch() {' <<< "$rcfn" || ! grep -q '^betaBranch() {' <<< "$rcfn" \
+   || ! grep -q '^newestBranch() {' <<< "$rcfn"; then
+    echo "FAIL: could not find rcBranch(), betaBranch() and newestBranch() in bin/bootstrap.sh." >&2
+    echo "  If it moved or was renamed, point this test at it -- do not" >&2
+    echo "  delete the assertions." >&2
+    exit 1
+fi
+eval "$rcfn"
+
+rcremote="$work/rc.git"
+rcseed="$work/rcseed"
+git init -q --bare "$rcremote"
+git init -q "$rcseed"
+git -C "$rcseed" config user.email t@example.invalid
+git -C "$rcseed" config user.name t
+echo x > "$rcseed/f"
+git -C "$rcseed" add f && git -C "$rcseed" commit -qm seed
+rcpublish() {
+    git -C "$rcseed" branch -f "$1" >/dev/null 2>&1
+    git -C "$rcseed" push -q "$rcremote" "$1" >/dev/null 2>&1
+}
+repo="$rcremote"
+
+rcpublish feat/rc-update-channel
+check "a feat/rc-* branch is not offered as a release candidate" \
+    "$([[ -z $(rcBranch) ]]; echo $?)"
+check "and rcBranch reports nothing published" \
+    "$(! rcBranch >/dev/null 2>&1; echo $?)"
+
+rcpublish rc-1.6.2
+rcpublish rc-1.6.10
+check "rc-1.6.10 beats rc-1.6.2 and the decoy" \
+    "$([[ $(rcBranch) == rc-1.6.10 ]]; echo $?)"
+
+# A remote that refuses the question -- no network, no credential -- proves
+# nothing about what is published, so it must not report "none published".
+check "an unreachable remote returns 3, not 1" \
+    "$(repo="$work/no-such-remote.git" rcBranch >/dev/null 2>&1; [[ $? -eq 3 ]]; echo $?)"
+
+check "with no working-* branch, beta reports nothing published" \
+    "$(! betaBranch >/dev/null 2>&1; echo $?)"
+rcpublish feat/working-notes
+rcpublish working-1.7
+rcpublish working-1.10
+check "beta follows the newest working-* branch, not the decoy" \
+    "$([[ $(betaBranch) == working-1.10 ]]; echo $?)"
+
+# ---------------------------------------------------------------------------
+# An existing FOG INSTALL is a different question from an existing CHECKOUT.
+#
+# The checkout test above asks whether --git-path holds a clone. A server
+# installed from a checkout somewhere else, or from a tarball, answers no to
+# that -- so this used to clone a second copy and run the installer over a live
+# server without ever saying it was an upgrade. Found on the first real machine
+# it was run on.
+# ---------------------------------------------------------------------------
+inst="$work/installed"
+mkdir -p "$inst/etc/fog" "$inst/opt/fog" "$inst/checkout/bin"
+printf "fogprogramdir='%s/opt/fog'\n" "$inst" > "$inst/etc/fog/fog.conf"
+printf '#!/bin/bash\necho "UPDATEFOG $*" >> "$CALLS"\n' > "$inst/checkout/bin/updatefog.sh"
+chmod +x "$inst/checkout/bin/updatefog.sh"
+
+# A copy pointed at the fixture's /etc and /opt rather than the real ones.
+instsut="$work/bootstrap-installed.sh"
+sed -e 's/^if \[\[ ! \$EUID -eq 0 \]\]; then$/if false; then/' \
+    -e "s#/etc/fog/fog.conf#$inst/etc/fog/fog.conf#g" \
+    -e "s#/opt/fog/.fogsettings#$inst/opt/fog/.fogsettings#g" \
+    "$bootstrap" > "$instsut"
+
+runInstalled() {
+    ( export PATH="$stubs:$PATH" CALLS="$calls" OS="Linux"
+      export linuxReleaseName="Ubuntu" OSVersion=22
+      unset osfamily
+      cd "$work" && bash "$instsut" "$@" )
+}
+
+# --- installed, WITH a checkout: hand over to the updater ------------------
+printf "FOG_git_path='%s/checkout'\n" "$inst" > "$inst/opt/fog/.fogsettings"
+: > "$calls"
+instout=$(runInstalled --channel beta --yes --git-path "$work/should-not-be-used" 2>&1)
+
+check "an existing install is noticed" \
+    "$(grep -q 'FOG is already installed' <<< "$instout"; echo $?)"
+
+check "and the updater is handed the job" \
+    "$(grep -q '^UPDATEFOG' "$calls"; echo $?)"
+
+check "with the channel passed through" \
+    "$(grep -q 'UPDATEFOG.*--channel beta' "$calls"; echo $?)"
+
+check "and --yes passed through" \
+    "$(grep -qE 'UPDATEFOG.*(-y|--yes)' "$calls"; echo $?)"
+
+check "nothing is cloned" \
+    "$(! grep -q '^git clone' "$calls"; echo $?)"
+
+check "and the recorded checkout is used, not --git-path" \
+    "$([[ ! -d $work/should-not-be-used ]]; echo $?)"
+
+# --- installed, NO checkout recorded: clone, and say it is an upgrade ------
+: > "$inst/opt/fog/.fogsettings"
+: > "$calls"
+instout=$(runInstalled --channel beta --yes --git-path "$work/tarballupgrade" 2>&1)
+
+check "a tarball install still gets a clone" \
+    "$(grep -q '^git clone' "$calls"; echo $?)"
+
+check "but is told plainly that this UPGRADES the running server" \
+    "$(grep -qi 'UPGRADE the existing server' <<< "$instout"; echo $?)"
+
+check "and the clone warns that the repository is large" \
+    "$(grep -qi 'repository is large' <<< "$instout"; echo $?)"
+
+
+# ---------------------------------------------------------------------------
+# It must not grow into an installer.
+# ---------------------------------------------------------------------------
+body=$(sed 's/#.*//' "$bootstrap")
+check "bootstrap does not source anything from the repo" \
+    "$(! grep -qE '^\s*\.\s+\.\./lib|^\s*source\s' <<< "$body"; echo $?)"
+# READING .fogsettings is expected now -- that is how it notices FOG is
+# already installed. WRITING it is still not its job: the installer and the
+# updater own that file, and a bootstrap that edited it would be a second
+# author.
+check "bootstrap does not write .fogsettings" \
+    "$(! grep -qE '>>?[[:space:]]*"?[^[:space:]]*[.]fogsettings' <<< "$body"; echo $?)"
+
+check "and does not call writeUpdateFile" \
+    "$(! grep -q 'writeUpdateFile' <<< "$body"; echo $?)"
+
+printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"
+[[ $fail -eq 0 ]]

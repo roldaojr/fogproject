@@ -1,0 +1,175 @@
+<?php
+/**
+ * Registers mac's to the host.
+ * If using the new client can also register new hosts
+ * into a pending status.
+ *
+ * PHP version 7.4+
+ *
+ * @category RegisterClient
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+
+namespace FOG\Client;
+
+use FOG\Items\Host;
+use FOG\Router\Route;
+
+/**
+ * Registers mac's to the host.
+ * If using the new client can also register new hosts
+ * into a pending status.
+ *
+ * @category RegisterClient
+ * @package  FOGProject
+ * @author   Tom Elliott <tommygunsster@gmail.com>
+ * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
+ * @link     https://fogproject.org
+ */
+class RegisterClient extends FOGClient
+{
+    /**
+     * Module associated shortname
+     *
+     * @var string
+     */
+    public $shortName = 'hostregister';
+
+    /**
+     * Function returns data that will be translated to json
+     *
+     * @return array
+     * @throws Exception
+     */
+    public function json()
+    {
+        $MACs = self::getHostItem(
+            true,
+            false,
+            false,
+            true
+        );
+        $keys = [
+            'FOG_ENFORCE_HOST_CHANGES',
+            'FOG_QUICKREG_MAX_PENDING_MACS'
+        ];
+        list(
+            $enforce,
+            $maxPending
+        ) = self::getSetting($keys);
+        $hostname = filter_input(INPUT_POST, 'hostname');
+        if (!$hostname) {
+            $hostname = filter_input(INPUT_GET, 'hostname');
+        }
+        $find = [
+            'hostID' => self::$Host->get('id'),
+            'pending' => [1]
+        ];
+        $pendingMACcount = count(Route::getIds('macaddressassociation', $find, 'mac') ?: []);
+        if (!self::$Host->isValid()) {
+            self::$Host = (new Host(['name' => $hostname]))->load('name');
+            if (!(self::$Host->isValid() && !self::$Host->get('pending'))) {
+                if (!(new Host())->isHostnameSafe($hostname)) {
+                    if (!self::$json) {
+                        echo '#!ih';
+                        exit;
+                    }
+                    return ['error' => 'ih'];
+                }
+                $PriMAC = array_shift($MACs);
+                self::$Host = (new Host())
+                    ->set('name', $hostname)
+                    ->set(
+                        'description',
+                        _('Pending Registration created by FOG_CLIENT')
+                    )
+                    // A pending registration names no image. NULL rather
+                    // than 0 since schema step 386 -- see that step.
+                    ->set('imageID', null)
+                    ->set('pending', "1")
+                    ->set('enforce', (string)$enforce)
+                    ->addPriMAC($PriMAC);
+                self::$Host->save();
+                if (!self::$Host->isValid()) {
+                    return ['error' => 'db'];
+                }
+                // Only after the save: addMAC() writes the hostMAC rows at
+                // once with the id the object holds, and before save() a new
+                // host holds none, so insertBatch()'s foreign-key guard threw
+                // and the whole registration died -- silently, because the
+                // client protocol answers an uncaught error with an empty
+                // 200. That made a multi-NIC machine unable to register at
+                // all while a single-NIC one worked. The primary is
+                // unaffected -- addPriMAC() stages it and save() writes it
+                // once the id exists.
+                if (count($MACs ?: [])) {
+                    self::$Host->addMAC($MACs);
+                }
+                return ['complete' => true];
+            }
+        }
+        $MACs = self::parseMacList(
+            $MACs,
+            false,
+            true
+        );
+        $KnownMACs = self::$Host->getMyMacs(false);
+        $MACs = array_unique(
+            array_diff(
+                $MACs,
+                (array)$KnownMACs
+            )
+        );
+        $lowerAndTrim = function ($element) {
+            return strtolower(trim($element));
+        };
+        $MACs = array_map(
+            $lowerAndTrim,
+            $MACs
+        );
+        if (count($MACs ?: [])) {
+            // Checked against the batch, not just what is already stored:
+            // the old `$pendingMACcount > $maxPending` let a host at the
+            // limit add one more batch, so 0 never disabled anything.
+            if (self::pendingLimitExceeded(
+                $pendingMACcount,
+                count($MACs),
+                $maxPending
+            )) {
+                return [
+                    'error' => sprintf(
+                        '%s. %s %d %s.',
+                        _('Too many MACs'),
+                        _('Only allowed to have'),
+                        $maxPending,
+                        _('additional macs')
+                    )
+                ];
+            }
+            self::$Host->addPendMAC($MACs);
+            if (!self::$Host->save()) {
+                return ['error' => 'db'];
+            }
+            return ['complete' => true];
+        }
+        return ['error' => 'ig'];
+    }
+    /**
+     * Whether storing $new more pending MACs would take a host past
+     * FOG_QUICKREG_MAX_PENDING_MACS. A max of 0 stores none, which is
+     * how pending MACs are turned off.
+     *
+     * @param int   $pending pending MACs the host already has
+     * @param int   $new     MACs this check-in would add
+     * @param mixed $max     the setting's value
+     *
+     * @return bool
+     */
+    public static function pendingLimitExceeded($pending, $new, $max)
+    {
+        return ($pending + $new) > max(0, (int)$max);
+    }
+}
