@@ -4,22 +4,24 @@
  *
  * PHP version 7.4+
  *
- * @category Subnetstorage
+ * @category SubnetStorage
  * @package  FOGProject
  * @author   Roldao Junior <roldaogjr@gmail.com>
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
+namespace FOG\Plugins\SubnetStorage\Items;
+
 /**
  * The subnet storage class.
  *
- * @category Subnetstorage
+ * @category SubnetStorage
  * @package  FOGProject
  * @author   Roldao Junior <roldaogjr@gmail.com>
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
-class Subnetstorage extends FOGController
+class SubnetStorage extends \FOG\Base\FOGController
 {
     /**
      * The subnetstorage table.
@@ -32,7 +34,7 @@ class Subnetstorage extends FOGController
      *
      * @var array
      */
-    protected $databaseFields = array(
+    protected $databaseFields = [
         'id' => 'ssID',
         'name' => 'ssName',
         'subnets' => 'ssSubnets',
@@ -40,47 +42,47 @@ class Subnetstorage extends FOGController
         'storagenodeID' => 'ssStorageNodeID',
         'tftp' => 'ssTftpEnabled',
         'protocol' => 'ssStorageNodeProto',
-    );
+    ];
     /**
      * The required fields.
      *
      * @var array
      */
-    protected $databaseFieldsRequired = array(
+    protected $databaseFieldsRequired = [
         'name',
         'subnets',
         'storagegroupID',
-    );
+    ];
     /**
      * Additional fields.
      *
      * @var array
      */
-    protected $additionalFields = array(
+    protected $additionalFields = [
         'storagegroup',
         'storagenode',
-    );
+    ];
     /**
      * Database -> Class field relationships.
      *
      * @var array
      */
-    protected $databaseFieldClassRelationships = array(
-        'StorageGroup' => array(
+    protected $databaseFieldClassRelationships = [
+        'StorageGroup' => [
             'id',
             'storagegroupID',
             'storagegroup'
-        ),
-        'StorageNode' => array(
+        ],
+        'StorageNode' => [
             'id',
             'storagenodeID',
             'storagenode'
-        )
-    );
+        ]
+    ];
     /**
      * Get the storage group of this subnet.
      *
-     * @return object
+     * @return \FOG\Items\StorageGroup
      */
     public function getStorageGroup()
     {
@@ -89,7 +91,7 @@ class Subnetstorage extends FOGController
     /**
      * Get the storage node of this subnet.
      *
-     * @return object
+     * @return \FOG\Items\StorageNode
      */
     public function getStorageNode()
     {
@@ -116,14 +118,10 @@ class Subnetstorage extends FOGController
      */
     public function isInSubnet($ip)
     {
-        return $this->getMatchLength($ip) > -1;
+        return self::matchLength($this->get('subnets'), $ip) > -1;
     }
     /**
      * Returns the prefix length of the narrowest subnet holding an address.
-     *
-     * The narrowest match wins when an address falls in the subnets of more
-     * than one item, so that a small subnet can point somewhere else than
-     * the wider subnet it sits in.
      *
      * @param string $ip the address to test
      *
@@ -131,14 +129,32 @@ class Subnetstorage extends FOGController
      */
     public function getMatchLength($ip)
     {
+        return self::matchLength($this->get('subnets'), $ip);
+    }
+    /**
+     * Returns the prefix length of the narrowest subnet of a list holding
+     * an address.
+     *
+     * The narrowest match wins when an address falls in more than one
+     * subnet, so that a small subnet can point somewhere else than the
+     * wider subnet it sits in.
+     *
+     * @param string $subnets comma or space separated CIDR list
+     * @param string $ip      the address to test
+     *
+     * @return int the prefix length, or -1 when no subnet holds the address
+     */
+    public static function matchLength($subnets, $ip)
+    {
         $match = -1;
         $ip = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4);
         if (false === $ip) {
             return $match;
         }
+        $ip = ip2long($ip);
         $subnets = preg_split(
             '/[\s,]+/',
-            (string)$this->get('subnets'),
+            (string)$subnets,
             -1,
             PREG_SPLIT_NO_EMPTY
         );
@@ -148,17 +164,15 @@ class Subnetstorage extends FOGController
             }
             list($net, $mask) = explode('/', $subnet, 2);
             $net = ip2long($net);
-            if (false === $net) {
+            if (false === $net || !ctype_digit($mask)) {
                 continue;
             }
             $mask = (int)$mask;
-            if ($mask < 0 || $mask > 32) {
+            if ($mask > 32) {
                 continue;
             }
-            $bits = $mask === 0 ? 0 : ~((1 << (32 - $mask)) - 1);
-            if ((ip2long($ip) & $bits) === ($net & $bits)
-                && $mask > $match
-            ) {
+            $bits = $mask === 0 ? 0 : (~((1 << (32 - $mask)) - 1)) & 0xFFFFFFFF;
+            if (($ip & $bits) === ($net & $bits) && $mask > $match) {
                 $match = $mask;
             }
         }

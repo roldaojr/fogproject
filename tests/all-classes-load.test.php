@@ -218,7 +218,12 @@ function _declaredClasses()
                 // constants.stub.php, which PHPStan loads as a bootstrap
                 // file and which declares no class at all -- FOG's own
                 // autoloader has nothing to find there and is not meant to.
-                && 0 !== strpos($f, 'build/');
+                && 0 !== strpos($f, 'build/')
+                // Third-party plugin sources kept in this fork. They are
+                // installed under /opt/fog/plugins (ADR 0009) and load from
+                // there, not from the repository root; each one carries its
+                // own tests/ that loads it through the real plugin root.
+                && 0 !== strpos($f, 'plugins/');
         }
     );
 

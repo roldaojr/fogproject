@@ -10,16 +10,7 @@
  * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
  * @link     https://fogproject.org
  */
-/**
- * Plugin configuration file.
- *
- * @category Config
- * @package  FOGProject
- * @author   Roldao Junior <roldaogjr@gmail.com>
- * @license  http://opensource.org/licenses/gpl-3.0 GPLv3
- * @link     https://fogproject.org
- */
-$fog_plugin = array();
+$fog_plugin = [];
 $fog_plugin['name'] = 'subnetstorage';
 $fog_plugin['description'] = sprintf(
     '%s %s. %s.',
@@ -28,6 +19,8 @@ $fog_plugin['description'] = sprintf(
     _('It works like the Location plugin but the match is made by'
     . ' the address of the host instead of a manual association')
 );
-$fog_plugin['menuicon'] = 'fa fa-sitemap fa-fw';
-$fog_plugin['menuicon_hover'] = null;
-$fog_plugin['entrypoint'] = 'html/run.php';
+$fog_plugin['menuicon'] = 'fas fa-sitemap fa-fw';
+$fog_plugin['version'] = '1.6.0';
+$fog_plugin['fog_min'] = '1.6.0';
+$fog_plugin['author'] = 'Roldao Junior';
+$fog_plugin['homepage'] = 'https://github.com/roldaojr/fogproject';
